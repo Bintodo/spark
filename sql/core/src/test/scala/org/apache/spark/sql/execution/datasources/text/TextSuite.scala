@@ -18,18 +18,25 @@
 package org.apache.spark.sql.execution.datasources.text
 
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 
 import org.apache.hadoop.io.SequenceFile.CompressionType
 import org.apache.hadoop.io.compress.GzipCodec
 
+import org.apache.spark.{SparkConf, SparkIllegalArgumentException, TestUtils}
 import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, Row, SaveMode}
+import org.apache.spark.sql.catalyst.util.HadoopCompressionCodec.{BZIP2, DEFLATE, GZIP, NONE}
+import org.apache.spark.sql.execution.datasources.CommonFileDataSourceSuite
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{StringType, StructType}
 import org.apache.spark.util.Utils
 
-class TextSuite extends QueryTest with SharedSQLContext {
+abstract class TextSuite extends QueryTest with SharedSparkSession with CommonFileDataSourceSuite {
   import testImplicits._
+
+  override protected def dataSourceFormat = "text"
 
   test("reading text file") {
     verifyFrame(spark.read.format("text").load(testFile))
@@ -86,7 +93,8 @@ class TextSuite extends QueryTest with SharedSQLContext {
 
   test("SPARK-13503 Support to specify the option for compression codec for TEXT") {
     val testDf = spark.read.text(testFile)
-    val extensionNameMap = Map("bzip2" -> ".bz2", "deflate" -> ".deflate", "gzip" -> ".gz")
+    val extensionNameMap = Seq(BZIP2, DEFLATE, GZIP)
+      .map(codec => codec.lowerCaseName() -> codec.getCompressionCodec.getDefaultExtension)
     extensionNameMap.foreach {
       case (codecName, extension) =>
         val tempDir = Utils.createTempDir()
@@ -97,12 +105,18 @@ class TextSuite extends QueryTest with SharedSQLContext {
         verifyFrame(spark.read.text(tempDirPath))
     }
 
-    val errMsg = intercept[IllegalArgumentException] {
-      val tempDirPath = Utils.createTempDir().getAbsolutePath
-      testDf.write.option("compression", "illegal").mode(SaveMode.Overwrite).text(tempDirPath)
+    withTempDir { dir =>
+      checkError(
+        exception = intercept[SparkIllegalArgumentException] {
+          testDf.write.option("compression", "illegal").mode(
+            SaveMode.Overwrite).text(dir.getAbsolutePath)
+        },
+        condition = "CODEC_NOT_AVAILABLE.WITH_AVAILABLE_CODECS_SUGGESTION",
+        parameters = Map(
+          "codecName" -> "illegal",
+          "availableCodecs" -> "bzip2, deflate, uncompressed, snappy, none, lz4, gzip")
+      )
     }
-    assert(errMsg.getMessage.contains("Codec [illegal] is not available. " +
-      "Known codecs are"))
   }
 
   test("SPARK-13543 Write the output as uncompressed via option()") {
@@ -116,7 +130,7 @@ class TextSuite extends QueryTest with SharedSQLContext {
     withTempDir { dir =>
       val testDf = spark.read.text(testFile)
       val tempDirPath = dir.getAbsolutePath
-      testDf.write.option("compression", "none")
+      testDf.write.option("compression", NONE.lowerCaseName())
         .options(extraOptions).mode(SaveMode.Overwrite).text(tempDirPath)
       val compressedFiles = new File(tempDirPath).listFiles()
       assert(compressedFiles.exists(!_.getName.endsWith(".txt.gz")))
@@ -135,7 +149,7 @@ class TextSuite extends QueryTest with SharedSQLContext {
     withTempDir { dir =>
       val testDf = spark.read.text(testFile)
       val tempDirPath = dir.getAbsolutePath
-      testDf.write.option("CoMpReSsIoN", "none")
+      testDf.write.option("CoMpReSsIoN", NONE.lowerCaseName())
         .options(extraOptions).mode(SaveMode.Overwrite).text(tempDirPath)
       val compressedFiles = new File(tempDirPath).listFiles()
       assert(compressedFiles.exists(!_.getName.endsWith(".txt.gz")))
@@ -160,7 +174,7 @@ class TextSuite extends QueryTest with SharedSQLContext {
     withTempDir { dir =>
       val path = dir.getCanonicalPath
       val df1 = spark.range(0, 1000).selectExpr("CAST(id AS STRING) AS s")
-      df1.write.option("compression", "gzip").mode("overwrite").text(path)
+      df1.write.option("compression", GZIP.lowerCaseName()).mode("overwrite").text(path)
 
       val expected = df1.collect()
       Seq(10, 100, 1000).foreach { bytes =>
@@ -171,6 +185,45 @@ class TextSuite extends QueryTest with SharedSQLContext {
       }
     }
   }
+
+  def testLineSeparator(lineSep: String): Unit = {
+    test(s"SPARK-23577: Support line separator - lineSep: '$lineSep'") {
+      // Read
+      val values = Seq("a", "b", "\nc")
+      val data = values.mkString(lineSep)
+      val dataWithTrailingLineSep = s"$data$lineSep"
+      Seq(data, dataWithTrailingLineSep).foreach { lines =>
+        withTempPath { path =>
+          Files.write(path.toPath, lines.getBytes(StandardCharsets.UTF_8))
+          val df = spark.read.option("lineSep", lineSep).text(path.getAbsolutePath)
+          checkAnswer(df, Seq("a", "b", "\nc").toDF())
+        }
+      }
+
+      // Write
+      withTempPath { path =>
+        values.toDF().coalesce(1)
+          .write.option("lineSep", lineSep).text(path.getAbsolutePath)
+        val partFile = TestUtils.recursiveList(path).filter(f => f.getName.startsWith("part-")).head
+        val readBack = new String(Files.readAllBytes(partFile.toPath), StandardCharsets.UTF_8)
+        assert(readBack === s"a${lineSep}b${lineSep}\nc${lineSep}")
+      }
+
+      // Roundtrip
+      withTempPath { path =>
+        val df = values.toDF()
+        df.write.option("lineSep", lineSep).text(path.getAbsolutePath)
+        val readBack = spark.read.option("lineSep", lineSep).text(path.getAbsolutePath)
+        checkAnswer(df, readBack)
+      }
+    }
+  }
+
+  // scalastyle:off nonascii
+  Seq("|", "^", "::", "!!!@3", 0x1E.toChar.toString, "아").foreach { lineSep =>
+    testLineSeparator(lineSep)
+  }
+  // scalastyle:on nonascii
 
   private def testFile: String = {
     Thread.currentThread().getContextClassLoader.getResource("test-data/text-suite.txt").toString
@@ -185,11 +238,33 @@ class TextSuite extends QueryTest with SharedSQLContext {
     val data = df.collect()
     assert(data(0) == Row("This is a test file for the text data source"))
     assert(data(1) == Row("1+1"))
-    // non ascii characters are not allowed in the code, so we disable the scalastyle here.
-    // scalastyle:off
+    // scalastyle:off nonascii
     assert(data(2) == Row("数据砖头"))
-    // scalastyle:on
+    // scalastyle:on nonascii
     assert(data(3) == Row("\"doh\""))
     assert(data.length == 4)
   }
+
+  test("SPARK-40667: validate Text Options") {
+    assert(TextOptions.getAllOptions.size == 4)
+    // Please add validation on any new Text options here
+    assert(TextOptions.isValidOption("compression"))
+    assert(TextOptions.isValidOption("wholetext"))
+    assert(TextOptions.isValidOption("encoding"))
+    assert(TextOptions.isValidOption("lineSep"))
+  }
+}
+
+class TextV1Suite extends TextSuite {
+  override protected def sparkConf: SparkConf =
+    super
+      .sparkConf
+      .set(SQLConf.USE_V1_SOURCE_LIST, "text")
+}
+
+class TextV2Suite extends TextSuite {
+  override protected def sparkConf: SparkConf =
+    super
+      .sparkConf
+      .set(SQLConf.USE_V1_SOURCE_LIST, "")
 }

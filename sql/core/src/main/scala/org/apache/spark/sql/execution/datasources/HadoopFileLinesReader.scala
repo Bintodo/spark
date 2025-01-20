@@ -18,38 +18,59 @@
 package org.apache.spark.sql.execution.datasources
 
 import java.io.Closeable
-import java.net.URI
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
 import org.apache.hadoop.io.Text
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.input.{FileSplit, LineRecordReader}
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 
+import org.apache.spark.util.Utils
+
 /**
  * An adaptor from a [[PartitionedFile]] to an [[Iterator]] of [[Text]], which are all of the lines
  * in that file.
+ *
+ * @param file A part (i.e. "block") of a single file that should be read line by line.
+ * @param lineSeparator A line separator that should be used for each line. If the value is `None`,
+ *                      it covers `\r`, `\r\n` and `\n`.
+ * @param conf Hadoop configuration
+ *
+ * @note The behavior when `lineSeparator` is `None` (covering `\r`, `\r\n` and `\n`) is defined
+ * by [[LineRecordReader]], not within Spark.
  */
 class HadoopFileLinesReader(
-    file: PartitionedFile, conf: Configuration) extends Iterator[Text] with Closeable {
-  private val iterator = {
+    file: PartitionedFile,
+    lineSeparator: Option[Array[Byte]],
+    conf: Configuration) extends Iterator[Text] with Closeable {
+
+  def this(file: PartitionedFile, conf: Configuration) = this(file, None, conf)
+
+  private val _iterator = {
     val fileSplit = new FileSplit(
-      new Path(new URI(file.filePath)),
+      file.toPath,
       file.start,
       file.length,
-      // TODO: Implement Locality
+      // The locality is decided by `getPreferredLocations` in `FileScanRDD`.
       Array.empty)
     val attemptId = new TaskAttemptID(new TaskID(new JobID(), TaskType.MAP, 0), 0)
     val hadoopAttemptContext = new TaskAttemptContextImpl(conf, attemptId)
-    val reader = new LineRecordReader()
-    reader.initialize(fileSplit, hadoopAttemptContext)
-    new RecordReaderIterator(reader)
+
+    Utils.tryInitializeResource(
+      lineSeparator match {
+        case Some(sep) => new LineRecordReader(sep)
+        // If the line separator is `None`, it covers `\r`, `\r\n` and `\n`.
+        case _ => new LineRecordReader()
+      }
+    ) { reader =>
+      reader.initialize(fileSplit, hadoopAttemptContext)
+      new RecordReaderIterator(reader)
+    }
   }
 
-  override def hasNext: Boolean = iterator.hasNext
+  override def hasNext: Boolean = _iterator.hasNext
 
-  override def next(): Text = iterator.next()
+  override def next(): Text = _iterator.next()
 
-  override def close(): Unit = iterator.close()
+  override def close(): Unit = _iterator.close()
 }

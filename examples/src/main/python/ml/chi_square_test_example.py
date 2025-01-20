@@ -15,19 +15,17 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
-
+"""
+An example for Chi-square hypothesis testing.
+Run with:
+  bin/spark-submit examples/src/main/python/ml/chi_square_test_example.py
+"""
 from pyspark.sql import SparkSession
 # $example on$
 from pyspark.ml.linalg import Vectors
 from pyspark.ml.stat import ChiSquareTest
 # $example off$
 
-"""
-An example for Chi-square hypothesis testing.
-Run with:
-  bin/spark-submit examples/src/main/python/ml/chi_square_test_example.py
-"""
 if __name__ == "__main__":
     spark = SparkSession \
         .builder \
@@ -44,6 +42,11 @@ if __name__ == "__main__":
     df = spark.createDataFrame(data, ["label", "features"])
 
     r = ChiSquareTest.test(df, "features", "label").head()
+
+    # $example off$
+    assert r is not None
+    # $example on$
+
     print("pValues: " + str(r.pValues))
     print("degreesOfFreedom: " + str(r.degreesOfFreedom))
     print("statistics: " + str(r.statistics))
