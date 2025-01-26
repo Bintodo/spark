@@ -15,10 +15,15 @@
  * limitations under the License.
  */
 
+/* global $ */
+
+import {formatTimeMillis, getTimeZone} from "./utils.js";
+
 $(document).ready(function() {
-    if ($('#last-updated').length) {
-      var lastUpdatedMillis = Number($('#last-updated').text());
-      var updatedDate = new Date(lastUpdatedMillis);
-      $('#last-updated').text(updatedDate.toLocaleDateString()+", "+updatedDate.toLocaleTimeString())
-    }
+  if ($('#last-updated').length) {
+    var lastUpdatedMillis = Number($('#last-updated').text());
+    $('#last-updated').text(formatTimeMillis(lastUpdatedMillis));
+  }
+
+  $('#time-zone').text(getTimeZone());
 });

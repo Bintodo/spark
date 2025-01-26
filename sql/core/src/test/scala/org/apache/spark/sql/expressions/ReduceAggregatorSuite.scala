@@ -17,17 +17,23 @@
 
 package org.apache.spark.sql.expressions
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkException, SparkFunSuite}
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 
 class ReduceAggregatorSuite extends SparkFunSuite {
 
   test("zero value") {
-    val encoder: ExpressionEncoder[Int] = ExpressionEncoder()
     val func = (v1: Int, v2: Int) => v1 + v2
     val aggregator: ReduceAggregator[Int] = new ReduceAggregator(func)(Encoders.scalaInt)
-    assert(aggregator.zero == (false, null))
+    assert(aggregator.zero == (false, 0))
+  }
+
+  test("zero value boxed null") {
+    val func = (v1: java.lang.Integer, v2: java.lang.Integer) =>
+      (v1 + v2).asInstanceOf[java.lang.Integer]
+    val aggregator: ReduceAggregator[java.lang.Integer] = new ReduceAggregator(func)(Encoders.INT)
+    assert(aggregator.zero == (false, null).asInstanceOf[(Boolean, java.lang.Integer)])
   }
 
   test("reduce, merge and finish") {
@@ -36,22 +42,22 @@ class ReduceAggregatorSuite extends SparkFunSuite {
     val aggregator: ReduceAggregator[Int] = new ReduceAggregator(func)(Encoders.scalaInt)
 
     val firstReduce = aggregator.reduce(aggregator.zero, 1)
-    assert(firstReduce == (true, 1))
+    assert(firstReduce == ((true, 1)))
 
     val secondReduce = aggregator.reduce(firstReduce, 2)
-    assert(secondReduce == (true, 3))
+    assert(secondReduce == ((true, 3)))
 
     val thirdReduce = aggregator.reduce(secondReduce, 3)
-    assert(thirdReduce == (true, 6))
+    assert(thirdReduce == ((true, 6)))
 
     val mergeWithZero1 = aggregator.merge(aggregator.zero, firstReduce)
-    assert(mergeWithZero1 == (true, 1))
+    assert(mergeWithZero1 == ((true, 1)))
 
     val mergeWithZero2 = aggregator.merge(secondReduce, aggregator.zero)
-    assert(mergeWithZero2 == (true, 3))
+    assert(mergeWithZero2 == ((true, 3)))
 
     val mergeTwoReduced = aggregator.merge(firstReduce, secondReduce)
-    assert(mergeTwoReduced == (true, 4))
+    assert(mergeTwoReduced == ((true, 4)))
 
     assert(aggregator.finish(firstReduce)== 1)
     assert(aggregator.finish(secondReduce) == 3)
@@ -66,7 +72,7 @@ class ReduceAggregatorSuite extends SparkFunSuite {
     val func = (v1: Int, v2: Int) => v1 + v2
     val aggregator: ReduceAggregator[Int] = new ReduceAggregator(func)(Encoders.scalaInt)
 
-    intercept[IllegalStateException] {
+    intercept[SparkException] {
       aggregator.finish(aggregator.zero)
     }
   }

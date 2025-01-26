@@ -19,15 +19,17 @@ package org.apache.spark.sql
 
 import java.util.Random
 
-import org.scalatest.Matchers._
+import org.scalatest.matchers.must.Matchers._
 
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.stat.StatFunctions
-import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.test.SharedSQLContext
-import org.apache.spark.sql.types.{DoubleType, StructField, StructType}
+import org.apache.spark.sql.functions.{col, lit, struct, when}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.{ArrayType, DoubleType, StringType, StructField, StructType}
 
-class DataFrameStatSuite extends QueryTest with SharedSQLContext {
+class DataFrameStatSuite extends QueryTest with SharedSparkSession {
   import testImplicits._
 
   private def toLetter(i: Int): String = (i + 97).toChar.toString
@@ -46,7 +48,7 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     val data = sparkContext.parallelize(1 to n, 2).toDF("id")
     checkAnswer(
       data.sample(withReplacement = false, 0.05, seed = 13),
-      Seq(3, 17, 27, 58, 62).map(Row(_))
+      Seq(37, 8, 90).map(Row(_))
     )
   }
 
@@ -125,6 +127,76 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     assert(math.abs(corr3 - 0.95723391394758572) < 1e-12)
   }
 
+  test("SPARK-30532 stat functions to understand fully-qualified column name") {
+    val df1 = spark.sparkContext.parallelize(0 to 10).toDF("num").as("table1")
+    val df2 = spark.sparkContext.parallelize(0 to 10).toDF("num").as("table2")
+    val dfx = df2.crossJoin(df1)
+
+    assert(dfx.stat.corr("table1.num", "table2.num") != 0.0)
+    assert(dfx.stat.cov("table1.num", "table2.num") != 0.0)
+    assert(dfx.stat.approxQuantile("table1.num", Array(0.1), 0.0).length == 1)
+    assert(dfx.stat.approxQuantile("table2.num", Array(0.1), 0.0).length == 1)
+    assert(dfx.stat.freqItems(Array("table1.num", "table2.num")).collect()(0).length == 2)
+
+    // this should throw "Reference 'num' is ambiguous"
+    checkError(
+      exception = intercept[AnalysisException] {
+        dfx.stat.freqItems(Array("num"))
+      },
+      condition = "AMBIGUOUS_REFERENCE",
+      parameters = Map(
+        "name" -> "`num`",
+        "referenceNames" -> "[`table1`.`num`, `table2`.`num`]"
+      ),
+      context =
+        ExpectedContext(fragment = "freqItems", callSitePattern = getCurrentClassCallSitePattern)
+    )
+    checkError(
+      exception = intercept[AnalysisException] {
+        dfx.stat.approxQuantile("num", Array(0.1), 0.0)
+      },
+      condition = "AMBIGUOUS_REFERENCE",
+      parameters = Map(
+        "name" -> "`num`",
+        "referenceNames" -> "[`table1`.`num`, `table2`.`num`]"
+      ),
+      context = ExpectedContext(
+        fragment = "approxQuantile", callSitePattern = getCurrentClassCallSitePattern)
+    )
+    checkError(
+      exception = intercept[AnalysisException] {
+        dfx.stat.cov("num", "num")
+      },
+      condition = "AMBIGUOUS_REFERENCE",
+      parameters = Map(
+        "name" -> "`num`",
+        "referenceNames" -> "[`table1`.`num`, `table2`.`num`]"
+      )
+    )
+    checkError(
+      exception = intercept[AnalysisException] {
+        dfx.stat.corr("num", "num")
+      },
+      condition = "AMBIGUOUS_REFERENCE",
+      parameters = Map(
+        "name" -> "`num`",
+        "referenceNames" -> "[`table1`.`num`, `table2`.`num`]"
+      )
+    )
+  }
+
+  test("SPARK-40933 test cov & corr with null values and empty dataset") {
+    val df1 = spark.range(0, 10)
+      .withColumn("value", when(col("id") % 3 === 0, col("id")))
+    assert(math.abs(df1.stat.cov("id", "value") - 5.0) < 1e-12)
+    assert(math.abs(df1.stat.corr("id", "value") - 0.5120915564991891) < 1e-12)
+
+    // empty dataframe
+    val df2 = df1.where(col("id") < 0)
+    assert(df2.stat.cov("id", "value") === 0)
+    assert(df2.stat.corr("id", "value").isNaN)
+  }
+
   test("covariance") {
     val df = Seq.tabulate(10)(i => (i, 2.0 * i, toLetter(i))).toDF("singles", "doubles", "letters")
 
@@ -140,7 +212,7 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
 
   test("approximate quantile") {
     val n = 1000
-    val df = Seq.tabulate(n)(i => (i, 2.0 * i)).toDF("singles", "doubles")
+    val df = Seq.tabulate(n + 1)(i => (i, 2.0 * i)).toDF("singles", "doubles")
 
     val q1 = 0.5
     val q2 = 0.8
@@ -153,31 +225,31 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
       val Array(d1, d2) = df.stat.approxQuantile("doubles", Array(q1, q2), epsilon)
       val Array(s1, s2) = df.stat.approxQuantile("singles", Array(q1, q2), epsilon)
 
-      val error_single = 2 * 1000 * epsilon
-      val error_double = 2 * 2000 * epsilon
+      val errorSingle = 1000 * epsilon
+      val errorDouble = 2.0 * errorSingle
 
-      assert(math.abs(single1 - q1 * n) < error_single)
-      assert(math.abs(double2 - 2 * q2 * n) < error_double)
-      assert(math.abs(s1 - q1 * n) < error_single)
-      assert(math.abs(s2 - q2 * n) < error_single)
-      assert(math.abs(d1 - 2 * q1 * n) < error_double)
-      assert(math.abs(d2 - 2 * q2 * n) < error_double)
+      assert(math.abs(single1 - q1 * n) <= errorSingle)
+      assert(math.abs(double2 - 2 * q2 * n) <= errorDouble)
+      assert(math.abs(s1 - q1 * n) <= errorSingle)
+      assert(math.abs(s2 - q2 * n) <= errorSingle)
+      assert(math.abs(d1 - 2 * q1 * n) <= errorDouble)
+      assert(math.abs(d2 - 2 * q2 * n) <= errorDouble)
 
       // Multiple columns
       val Array(Array(ms1, ms2), Array(md1, md2)) =
         df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2), epsilon)
 
-      assert(math.abs(ms1 - q1 * n) < error_single)
-      assert(math.abs(ms2 - q2 * n) < error_single)
-      assert(math.abs(md1 - 2 * q1 * n) < error_double)
-      assert(math.abs(md2 - 2 * q2 * n) < error_double)
+      assert(math.abs(ms1 - q1 * n) <= errorSingle)
+      assert(math.abs(ms2 - q2 * n) <= errorSingle)
+      assert(math.abs(md1 - 2 * q1 * n) <= errorDouble)
+      assert(math.abs(md2 - 2 * q2 * n) <= errorDouble)
     }
 
     // quantile should be in the range [0.0, 1.0]
     val e = intercept[IllegalArgumentException] {
       df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2, -0.1), epsilons.head)
     }
-    assert(e.getMessage.contains("quantile should be in the range [0.0, 1.0]"))
+    assert(e.getMessage.contains("percentile should be in the range [0.0, 1.0]"))
 
     // relativeError should be non-negative
     val e2 = intercept[IllegalArgumentException] {
@@ -229,11 +301,9 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
 
     val resNaN1 = dfNaN.stat.approxQuantile("input1", Array(q1, q2), epsilon)
     assert(resNaN1.count(_.isNaN) === 0)
-    assert(resNaN1.count(_ == null) === 0)
 
     val resNaN2 = dfNaN.stat.approxQuantile("input2", Array(q1, q2), epsilon)
     assert(resNaN2.count(_.isNaN) === 0)
-    assert(resNaN2.count(_ == null) === 0)
 
     val resNaN3 = dfNaN.stat.approxQuantile("input3", Array(q1, q2), epsilon)
     assert(resNaN3.isEmpty)
@@ -241,7 +311,6 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     val resNaNAll = dfNaN.stat.approxQuantile(Array("input1", "input2", "input3"),
       Array(q1, q2), epsilon)
     assert(resNaNAll.flatten.count(_.isNaN) === 0)
-    assert(resNaNAll.flatten.count(_ == null) === 0)
 
     assert(resNaN1(0) === resNaNAll(0)(0))
     assert(resNaN1(1) === resNaNAll(0)(1))
@@ -262,53 +331,65 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     assert(res2(1).isEmpty)
   }
 
+  // SPARK-22957: check for 32bit overflow when computing rank.
+  // ignored - takes 4 minutes to run.
+  ignore("approx quantile 4: test for Int overflow") {
+    val res = spark.range(3000000000L).stat.approxQuantile("id", Array(0.8, 0.9), 0.05)
+    assert(res(0) > 2200000000.0)
+    assert(res(1) > 2200000000.0)
+  }
+
   test("crosstab") {
-    val rng = new Random()
-    val data = Seq.tabulate(25)(i => (rng.nextInt(5), rng.nextInt(10)))
-    val df = data.toDF("a", "b")
-    val crosstab = df.stat.crosstab("a", "b")
-    val columnNames = crosstab.schema.fieldNames
-    assert(columnNames(0) === "a_b")
-    // reduce by key
-    val expected = data.map(t => (t, 1)).groupBy(_._1).mapValues(_.length)
-    val rows = crosstab.collect()
-    rows.foreach { row =>
-      val i = row.getString(0).toInt
-      for (col <- 1 until columnNames.length) {
-        val j = columnNames(col).toInt
-        assert(row.getLong(col) === expected.getOrElse((i, j), 0).toLong)
+    withSQLConf(SQLConf.SUPPORT_QUOTED_REGEX_COLUMN_NAME.key -> "false") {
+      val rng = new Random()
+      val data = Seq.tabulate(25)(i => (rng.nextInt(5), rng.nextInt(10)))
+      val df = data.toDF("a", "b")
+      val crosstab = df.stat.crosstab("a", "b")
+      val columnNames = crosstab.schema.fieldNames
+      assert(columnNames(0) === "a_b")
+      // reduce by key
+      val expected = data.map(t => (t, 1)).groupBy(_._1).transform((_, v) => v.length)
+      val rows = crosstab.collect()
+      rows.foreach { row =>
+        val i = row.getString(0).toInt
+        for (col <- 1 until columnNames.length) {
+          val j = columnNames(col).toInt
+          assert(row.getLong(col) === expected.getOrElse((i, j), 0).toLong)
+        }
       }
     }
   }
 
   test("special crosstab elements (., '', null, ``)") {
-    val data = Seq(
-      ("a", Double.NaN, "ho"),
-      (null, 2.0, "ho"),
-      ("a.b", Double.NegativeInfinity, ""),
-      ("b", Double.PositiveInfinity, "`ha`"),
-      ("a", 1.0, null)
-    )
-    val df = data.toDF("1", "2", "3")
-    val ct1 = df.stat.crosstab("1", "2")
-    // column fields should be 1 + distinct elements of second column
-    assert(ct1.schema.fields.length === 6)
-    assert(ct1.collect().length === 4)
-    val ct2 = df.stat.crosstab("1", "3")
-    assert(ct2.schema.fields.length === 5)
-    assert(ct2.schema.fieldNames.contains("ha"))
-    assert(ct2.collect().length === 4)
-    val ct3 = df.stat.crosstab("3", "2")
-    assert(ct3.schema.fields.length === 6)
-    assert(ct3.schema.fieldNames.contains("NaN"))
-    assert(ct3.schema.fieldNames.contains("Infinity"))
-    assert(ct3.schema.fieldNames.contains("-Infinity"))
-    assert(ct3.collect().length === 4)
-    val ct4 = df.stat.crosstab("3", "1")
-    assert(ct4.schema.fields.length === 5)
-    assert(ct4.schema.fieldNames.contains("null"))
-    assert(ct4.schema.fieldNames.contains("a.b"))
-    assert(ct4.collect().length === 4)
+    withSQLConf(SQLConf.SUPPORT_QUOTED_REGEX_COLUMN_NAME.key -> "false") {
+      val data = Seq(
+        ("a", Double.NaN, "ho"),
+        (null, 2.0, "ho"),
+        ("a.b", Double.NegativeInfinity, ""),
+        ("b", Double.PositiveInfinity, "`ha`"),
+        ("a", 1.0, null)
+      )
+      val df = data.toDF("1", "2", "3")
+      val ct1 = df.stat.crosstab("1", "2")
+      // column fields should be 1 + distinct elements of second column
+      assert(ct1.schema.fields.length === 6)
+      assert(ct1.collect().length === 4)
+      val ct2 = df.stat.crosstab("1", "3")
+      assert(ct2.schema.fields.length === 5)
+      assert(ct2.schema.fieldNames.contains("ha"))
+      assert(ct2.collect().length === 4)
+      val ct3 = df.stat.crosstab("3", "2")
+      assert(ct3.schema.fields.length === 6)
+      assert(ct3.schema.fieldNames.contains("NaN"))
+      assert(ct3.schema.fieldNames.contains("Infinity"))
+      assert(ct3.schema.fieldNames.contains("-Infinity"))
+      assert(ct3.collect().length === 4)
+      val ct4 = df.stat.crosstab("3", "1")
+      assert(ct4.schema.fields.length === 5)
+      assert(ct4.schema.fieldNames.contains("null"))
+      assert(ct4.schema.fieldNames.contains("a.b"))
+      assert(ct4.collect().length === 4)
+    }
   }
 
   test("Frequent Items") {
@@ -356,12 +437,54 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     }
   }
 
+  test("SPARK-28818: Respect original column nullability in `freqItems`") {
+    val rows = spark.sparkContext.parallelize(
+      Seq(Row("1", "a"), Row("2", null), Row("3", "b"))
+    )
+    val schema = StructType(Seq(
+      StructField("non_null", StringType, false),
+      StructField("nullable", StringType, true)
+    ))
+    val df = spark.createDataFrame(rows, schema)
+
+    val result = df.stat.freqItems(df.columns)
+
+    val nonNullableDataType = result.schema("non_null_freqItems").dataType.asInstanceOf[ArrayType]
+    val nullableDataType = result.schema("nullable_freqItems").dataType.asInstanceOf[ArrayType]
+
+    assert(nonNullableDataType.containsNull == false)
+    assert(nullableDataType.containsNull == true)
+    // Original bug was a NullPointerException exception caused by calling collect(), test for this
+    val resultRow = result.collect()(0)
+
+    assert(resultRow.get(0).asInstanceOf[scala.collection.Seq[String]].toSet == Set("1", "2", "3"))
+    assert(resultRow.get(1).asInstanceOf[scala.collection.Seq[String]].toSet == Set("a", "b", null))
+  }
+
   test("sampleBy") {
     val df = spark.range(0, 100).select((col("id") % 3).as("key"))
     val sampled = df.stat.sampleBy("key", Map(0 -> 0.1, 1 -> 0.2), 0L)
     checkAnswer(
       sampled.groupBy("key").count().orderBy("key"),
-      Seq(Row(0, 6), Row(1, 11)))
+      Seq(Row(0, 1), Row(1, 6)))
+  }
+
+  test("sampleBy one column") {
+    val df = spark.range(0, 100).select((col("id") % 3).as("key"))
+    val sampled = df.stat.sampleBy($"key", Map(0 -> 0.1, 1 -> 0.2), 0L)
+    checkAnswer(
+      sampled.groupBy("key").count().orderBy("key"),
+      Seq(Row(0, 1), Row(1, 6)))
+  }
+
+  test("sampleBy multiple columns") {
+    val df = spark.range(0, 100)
+      .select(lit("Foo").as("name"), (col("id") % 3).as("key"))
+    val sampled = df.stat.sampleBy(
+      struct($"name", $"key"), Map(Row("Foo", 0) -> 0.1, Row("Foo", 1) -> 0.2), 0L)
+    checkAnswer(
+      sampled.groupBy("key").count().orderBy("key"),
+      Seq(Row(0, 1), Row(1, 6)))
   }
 
   // This test case only verifies that `DataFrame.countMinSketch()` methods do return
@@ -390,10 +513,10 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     assert(sketch4.relativeError() === 0.001 +- 1e04)
     assert(sketch4.confidence() === 0.99 +- 5e-3)
 
-    intercept[IllegalArgumentException] {
-      df.select('id cast DoubleType as 'id)
+    intercept[AnalysisException] {
+      df.select($"id" cast DoubleType as "id")
         .stat
-        .countMinSketch('id, depth = 10, width = 20, seed = 42)
+        .countMinSketch($"id", depth = 10, width = 20, seed = 42)
     }
   }
 
@@ -418,10 +541,74 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     assert(filter4.bitSize() == 64 * 5)
     assert(0.until(1000).forall(i => filter4.mightContain(i * 3)))
   }
+
+  test("SPARK-34165: Add count_distinct to summary") {
+    val person3: DataFrame = Seq(
+      ("Luis", 1, 99),
+      ("Luis", 16, 99),
+      ("Luis", 16, 176),
+      ("Fernando", 32, 99),
+      ("Fernando", 32, 164),
+      ("David", 60, 99),
+      ("Amy", 24, 99)).toDF("name", "age", "height")
+    val summaryDF = person3.summary("count", "count_distinct")
+
+    val summaryResult = Seq(
+      Row("count", "7", "7", "7"),
+      Row("count_distinct", "4", "5", "3"))
+
+    def getSchemaAsSeq(df: DataFrame): Seq[String] = df.schema.map(_.name)
+    assert(getSchemaAsSeq(summaryDF) === Seq("summary", "name", "age", "height"))
+    checkAnswer(summaryDF, summaryResult)
+
+    val approxSummaryDF = person3.summary("count", "approx_count_distinct")
+    val approxSummaryResult = Seq(
+      Row("count", "7", "7", "7"),
+      Row("approx_count_distinct", "4", "5", "3"))
+    assert(getSchemaAsSeq(summaryDF) === Seq("summary", "name", "age", "height"))
+    checkAnswer(approxSummaryDF, approxSummaryResult)
+  }
+
+  test("summary advanced") {
+    import org.apache.spark.util.ArrayImplicits._
+    val person2: DataFrame = Seq(
+      ("Bob", 16, 176),
+      ("Alice", 32, 164),
+      ("David", 60, 192),
+      ("Amy", 24, 180)).toDF("name", "age", "height")
+
+    val stats = Array("count", "50.01%", "max", "mean", "min", "25%")
+    val orderMatters = person2.summary(stats.toImmutableArraySeq: _*)
+    assert(orderMatters.collect().map(_.getString(0)) === stats)
+
+    val onlyPercentiles = person2.summary("0.1%", "99.9%")
+    assert(onlyPercentiles.count() === 2)
+
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        person2.summary("foo")
+      },
+      condition = "UNRECOGNIZED_STATISTIC",
+      parameters = Map("stats" -> "'foo'")
+    )
+
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        person2.summary("foo%")
+      },
+      condition = "UNRECOGNIZED_STATISTIC",
+      parameters = Map("stats" -> "'foo%'")
+    )
+  }
+
+  test("SPARK-19691 Calculating percentile of decimal column fails with ClassCastException") {
+    val df = spark.range(1).selectExpr("CAST(id as DECIMAL) as x").selectExpr("percentile(x, 0.5)")
+    checkAnswer(df, Row(BigDecimal(0)) :: Nil)
+  }
 }
 
 
-class DataFrameStatPerfSuite extends QueryTest with SharedSQLContext with Logging {
+class DataFrameStatPerfSuite extends QueryTest with SharedSparkSession with Logging {
 
   // Turn on this test if you want to test the performance of approximate quantiles.
   ignore("computing quantiles should not take much longer than describe()") {

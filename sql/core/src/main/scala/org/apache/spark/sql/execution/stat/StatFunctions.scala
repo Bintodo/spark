@@ -17,14 +17,17 @@
 
 package org.apache.spark.sql.execution.stat
 
+import java.util.Locale
+
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{Column, DataFrame, Dataset, Row}
-import org.apache.spark.sql.catalyst.expressions.{Cast, GenericInternalRow}
-import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.{Column, Row}
+import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.util.QuantileSummaries
+import org.apache.spark.sql.classic.{DataFrame, Dataset}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
 
 object StatFunctions extends Logging {
 
@@ -41,7 +44,7 @@ object StatFunctions extends Logging {
    *
    * This method implements a variation of the Greenwald-Khanna algorithm (with some speed
    * optimizations).
-   * The algorithm was first present in <a href="http://dx.doi.org/10.1145/375663.375670">
+   * The algorithm was first present in <a href="https://doi.org/10.1145/375663.375670">
    * Space-efficient Online Computation of Quantile Summaries</a> by Greenwald and Khanna.
    *
    * @param df the dataframe
@@ -66,11 +69,11 @@ object StatFunctions extends Logging {
     require(relativeError >= 0,
       s"Relative Error must be non-negative but got $relativeError")
     val columns: Seq[Column] = cols.map { colName =>
-      val field = df.schema(colName)
+      val field = df.resolve(colName)
       require(field.dataType.isInstanceOf[NumericType],
         s"Quantile calculation for column $colName with data type ${field.dataType}" +
         " is not supported.")
-      Column(Cast(Column(colName).expr, DoubleType))
+      Column(colName).cast(DoubleType)
     }
     val emptySummaries = Array.fill(cols.size)(
       new QuantileSummaries(QuantileSummaries.defaultCompressThreshold, relativeError))
@@ -95,74 +98,44 @@ object StatFunctions extends Logging {
         sum2: Array[QuantileSummaries]): Array[QuantileSummaries] = {
       sum1.zip(sum2).map { case (s1, s2) => s1.compress().merge(s2.compress()) }
     }
-    val summaries = df.select(columns: _*).rdd.aggregate(emptySummaries)(apply, merge)
+    val summaries = df.select(columns: _*).rdd.treeAggregate(emptySummaries)(apply, merge)
 
-    summaries.map { summary => probabilities.flatMap(summary.query) }
+    summaries.map {
+      summary => summary.query(probabilities) match {
+        case Some(q) => q
+        case None => Seq()
+      }
+    }.toImmutableArraySeq
   }
 
   /** Calculate the Pearson Correlation Coefficient for the given columns */
   def pearsonCorrelation(df: DataFrame, cols: Seq[String]): Double = {
-    val counts = collectStatisticalData(df, cols, "correlation")
-    counts.Ck / math.sqrt(counts.MkX * counts.MkY)
+    calculateCorrImpl(df, cols).head().getDouble(0)
   }
 
-  /** Helper class to simplify tracking and merging counts. */
-  private class CovarianceCounter extends Serializable {
-    var xAvg = 0.0 // the mean of all examples seen so far in col1
-    var yAvg = 0.0 // the mean of all examples seen so far in col2
-    var Ck = 0.0 // the co-moment after k examples
-    var MkX = 0.0 // sum of squares of differences from the (current) mean for col1
-    var MkY = 0.0 // sum of squares of differences from the (current) mean for col2
-    var count = 0L // count of observed examples
-    // add an example to the calculation
-    def add(x: Double, y: Double): this.type = {
-      val deltaX = x - xAvg
-      val deltaY = y - yAvg
-      count += 1
-      xAvg += deltaX / count
-      yAvg += deltaY / count
-      Ck += deltaX * (y - yAvg)
-      MkX += deltaX * (x - xAvg)
-      MkY += deltaY * (y - yAvg)
-      this
-    }
-    // merge counters from other partitions. Formula can be found at:
-    // http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
-    def merge(other: CovarianceCounter): this.type = {
-      if (other.count > 0) {
-        val totalCount = count + other.count
-        val deltaX = xAvg - other.xAvg
-        val deltaY = yAvg - other.yAvg
-        Ck += other.Ck + deltaX * deltaY * count / totalCount * other.count
-        xAvg = (xAvg * count + other.xAvg * other.count) / totalCount
-        yAvg = (yAvg * count + other.yAvg * other.count) / totalCount
-        MkX += other.MkX + deltaX * deltaX * count / totalCount * other.count
-        MkY += other.MkY + deltaY * deltaY * count / totalCount * other.count
-        count = totalCount
-      }
-      this
-    }
-    // return the sample covariance for the observed examples
-    def cov: Double = Ck / (count - 1)
-  }
+  private[sql] def calculateCorrImpl(
+    df: DataFrame,
+    cols: Seq[String],
+    method: String = "pearson"): DataFrame = {
+    require(method == "pearson", "Currently only the calculation of the Pearson Correlation " +
+      "coefficient is supported.")
+    require(cols.length == 2,
+      "Currently correlation calculation is supported between two columns.")
 
-  private def collectStatisticalData(df: DataFrame, cols: Seq[String],
-              functionName: String): CovarianceCounter = {
-    require(cols.length == 2, s"Currently $functionName calculation is supported " +
-      "between two columns.")
-    cols.map(name => (name, df.schema.fields.find(_.name == name))).foreach { case (name, data) =>
-      require(data.nonEmpty, s"Couldn't find column with name $name")
-      require(data.get.dataType.isInstanceOf[NumericType], s"Currently $functionName calculation " +
-        s"for columns with dataType ${data.get.dataType} not supported.")
+    val Seq(col1, col2) = cols.map { c =>
+      val dataType = df.resolve(c).dataType
+      require(dataType.isInstanceOf[NumericType],
+        "Currently correlation calculation for columns with dataType " +
+          s"${dataType.catalogString} not supported.")
+      when(isnull(col(c)), lit(0.0))
+        .otherwise(col(c).cast(DoubleType))
     }
-    val columns = cols.map(n => Column(Cast(Column(n).expr, DoubleType)))
-    df.select(columns: _*).queryExecution.toRdd.aggregate(new CovarianceCounter)(
-      seqOp = (counter, row) => {
-        counter.add(row.getDouble(0), row.getDouble(1))
-      },
-      combOp = (baseCounter, other) => {
-        baseCounter.merge(other)
-    })
+    val correlation = corr(col1, col2)
+    df.select(
+      when(isnull(correlation), lit(Double.NaN))
+        .otherwise(correlation)
+        .as("corr")
+    )
   }
 
   /**
@@ -172,52 +145,119 @@ object StatFunctions extends Logging {
    * @return the covariance of the two columns.
    */
   def calculateCov(df: DataFrame, cols: Seq[String]): Double = {
-    val counts = collectStatisticalData(df, cols, "covariance")
-    counts.cov
+    calculateCovImpl(df, cols).head().getDouble(0)
+  }
+
+  private[sql] def calculateCovImpl(df: DataFrame, cols: Seq[String]): DataFrame = {
+    require(cols.length == 2,
+      "Currently covariance calculation is supported between two columns.")
+    val Seq(col1, col2) = cols.map { c =>
+      val dataType = df.resolve(c).dataType
+      require(dataType.isInstanceOf[NumericType],
+        "Currently covariance calculation for columns with dataType " +
+          s"${dataType.catalogString} not supported.")
+      when(isnull(col(c)), lit(0.0))
+        .otherwise(col(c).cast(DoubleType))
+    }
+    val covariance = covar_samp(col1, col2)
+    df.select(
+      when(isnull(covariance), lit(0.0))
+        .otherwise(covariance)
+        .as("cov")
+    )
   }
 
   /** Generate a table of frequencies for the elements of two columns. */
   def crossTabulate(df: DataFrame, col1: String, col2: String): DataFrame = {
-    val tableName = s"${col1}_$col2"
-    val counts = df.groupBy(col1, col2).agg(count("*")).take(1e6.toInt)
-    if (counts.length == 1e6.toInt) {
-      logWarning("The maximum limit of 1e6 pairs have been collected, which may not be all of " +
-        "the pairs. Please try reducing the amount of distinct items in your columns.")
-    }
-    def cleanElement(element: Any): String = {
-      if (element == null) "null" else element.toString
-    }
-    // get the distinct sorted values of column 2, so that we can make them the column names
-    val distinctCol2: Map[Any, Int] =
-      counts.map(e => cleanElement(e.get(1))).distinct.sorted.zipWithIndex.toMap
-    val columnSize = distinctCol2.size
-    require(columnSize < 1e4, s"The number of distinct values for $col2, can't " +
-      s"exceed 1e4. Currently $columnSize")
-    val table = counts.groupBy(_.get(0)).map { case (col1Item, rows) =>
-      val countsRow = new GenericInternalRow(columnSize + 1)
-      rows.foreach { (row: Row) =>
-        // row.get(0) is column 1
-        // row.get(1) is column 2
-        // row.get(2) is the frequency
-        val columnIndex = distinctCol2.get(cleanElement(row.get(1))).get
-        countsRow.setLong(columnIndex + 1, row.getLong(2))
-      }
-      // the value of col1 is the first value, the rest are the counts
-      countsRow.update(0, UTF8String.fromString(cleanElement(col1Item)))
-      countsRow
-    }.toSeq
-    // Back ticks can't exist in DataFrame column names, therefore drop them. To be able to accept
-    // special keywords and `.`, wrap the column names in ``.
-    def cleanColumnName(name: String): String = {
-      name.replace("`", "")
-    }
-    // In the map, the column names (._1) are not ordered by the index (._2). This was the bug in
-    // SPARK-8681. We need to explicitly sort by the column index and assign the column names.
-    val headerNames = distinctCol2.toSeq.sortBy(_._2).map { r =>
-      StructField(cleanColumnName(r._1.toString), LongType)
-    }
-    val schema = StructType(StructField(tableName, StringType) +: headerNames)
+    df.groupBy(
+      when(isnull(col(col1)), "null")
+        .otherwise(col(col1).cast("string"))
+        .as(s"${col1}_$col2")
+    ).pivot(
+      when(isnull(col(col2)), "null")
+        .otherwise(regexp_replace(col(col2).cast("string"), "`", ""))
+    ).count().na.fill(0L)
+  }
 
-    Dataset.ofRows(df.sparkSession, LocalRelation(schema.toAttributes, table)).na.fill(0.0)
+  /** Calculate selected summary statistics for a dataset */
+  def summary(ds: Dataset[_], statistics: Seq[String]): DataFrame = {
+    val selectedStatistics = if (statistics.nonEmpty) {
+      statistics.toArray
+    } else {
+      Array("count", "mean", "stddev", "min", "25%", "50%", "75%", "max")
+    }
+
+    val percentiles = selectedStatistics.filter(a => a.endsWith("%")).map { p =>
+      try {
+        p.stripSuffix("%").toDouble / 100.0
+      } catch {
+        case e: NumberFormatException =>
+          throw QueryExecutionErrors.cannotParseStatisticAsPercentileError(p, e)
+      }
+    }
+    require(percentiles.forall(p => p >= 0 && p <= 1), "Percentiles must be in the range [0, 1]")
+
+    var mapColumns = Seq.empty[Column]
+    var columnNames = Seq.empty[String]
+
+    ds.schema.fields.foreach { field =>
+      if (field.dataType.isInstanceOf[NumericType] || field.dataType.isInstanceOf[StringType]) {
+        val column = col(field.name)
+        var casted = column
+        if (field.dataType.isInstanceOf[StringType]) {
+          casted = column.try_cast(DoubleType)
+        }
+
+        val percentilesCol = if (percentiles.nonEmpty) {
+          percentile_approx(casted, lit(percentiles),
+            lit(ApproximatePercentile.DEFAULT_PERCENTILE_ACCURACY))
+        } else null
+
+        var aggColumns = Seq.empty[Column]
+        var percentileIndex = 0
+        selectedStatistics.foreach { stats =>
+          aggColumns :+= lit(stats)
+
+          stats.toLowerCase(Locale.ROOT) match {
+            case "count" => aggColumns :+= count(column)
+
+            case "count_distinct" => aggColumns :+= count_distinct(column)
+
+            case "approx_count_distinct" => aggColumns :+= approx_count_distinct(column)
+
+            case "mean" => aggColumns :+= avg(casted)
+
+            case "stddev" => aggColumns :+= stddev(casted)
+
+            case "min" => aggColumns :+= min(column)
+
+            case "max" => aggColumns :+= max(column)
+
+            case percentile if percentile.endsWith("%") =>
+              aggColumns :+= get(percentilesCol, lit(percentileIndex))
+              percentileIndex += 1
+
+            case _ => throw QueryExecutionErrors.statisticNotRecognizedError(stats)
+          }
+        }
+
+        // map { "count" -> "1024", "min" -> "1.0", ... }
+        mapColumns :+= map(aggColumns.map(_.cast(StringType)): _*).as(field.name)
+        columnNames :+= field.name
+      }
+    }
+
+    if (mapColumns.isEmpty) {
+      ds.sparkSession.createDataFrame(selectedStatistics.map(Tuple1.apply).toImmutableArraySeq)
+        .withColumnRenamed("_1", "summary")
+    } else {
+      val valueColumns = columnNames.map { columnName =>
+        element_at(col(columnName), col("summary")).as(columnName)
+      }
+      import org.apache.spark.util.ArrayImplicits._
+      ds.select(mapColumns: _*)
+        .withColumn("summary", explode(lit(selectedStatistics)))
+        .select((Array(col("summary")) ++ valueColumns).toImmutableArraySeq: _*)
+    }
   }
 }

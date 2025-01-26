@@ -23,6 +23,7 @@ import org.apache.spark.{SparkContext, SparkException, SparkFunSuite, TaskContex
 import org.apache.spark.LocalSparkContext._
 import org.apache.spark.partial.CountEvaluator
 import org.apache.spark.rdd.RDD
+import org.apache.spark.util.ArrayImplicits._
 
 class ClosureCleanerSuite extends SparkFunSuite {
   test("closures inside an object") {
@@ -72,7 +73,7 @@ class ClosureCleanerSuite extends SparkFunSuite {
       try {
         body
       } catch {
-        case rse: ReturnStatementInClosureException => // Success!
+        case _: ReturnStatementInClosureException => // Success!
         case e @ (_: NotSerializableException | _: SparkException) =>
           fail(s"Expected ReturnStatementInClosureException, but got $e.\n" +
             "This means the closure provided by user is not actually cleaned.")
@@ -119,6 +120,7 @@ class ClosureCleanerSuite extends SparkFunSuite {
   test("createNullValue") {
     new TestCreateNullValue().run()
   }
+
 }
 
 // A non-serializable class we create in closures to make sure that we aren't
@@ -139,21 +141,21 @@ object TestObject {
     var nonSer = new NonSerializable
     val x = 5
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + x).reduce(_ + _)
     }
   }
 }
 
 class TestClass extends Serializable {
-  var x = 5
+  val x = 5
 
   def getX: Int = x
 
   def run(): Int = {
     var nonSer = new NonSerializable
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + getX).reduce(_ + _)
     }
   }
@@ -165,7 +167,7 @@ class TestClassWithoutDefaultConstructor(x: Int) extends Serializable {
   def run(): Int = {
     var nonSer = new NonSerializable
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + getX).reduce(_ + _)
     }
   }
@@ -178,9 +180,9 @@ class TestClassWithoutFieldAccess {
 
   def run(): Int = {
     var nonSer2 = new NonSerializable
-    var x = 5
+    val x = 5
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + x).reduce(_ + _)
     }
   }
@@ -189,7 +191,7 @@ class TestClassWithoutFieldAccess {
 object TestObjectWithBogusReturns {
   def run(): Int = {
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       // this return is invalid since it will transfer control outside the closure
       nums.map {x => return 1 ; x * 2}
       1
@@ -200,7 +202,7 @@ object TestObjectWithBogusReturns {
 object TestObjectWithNestedReturns {
   def run(): Int = {
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map {x =>
         // this return is fine since it will not transfer control outside the closure
         def foo(): Int = { return 5; 1 }
@@ -216,11 +218,11 @@ object TestObjectWithNesting {
     var nonSer = new NonSerializable
     var answer = 0
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
-      var y = 1
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
+      val y = 1
       for (i <- 1 to 4) {
         var nonSer2 = new NonSerializable
-        var x = i
+        val x = i
         answer += nums.map(_ + x + y).reduce(_ + _)
       }
       answer
@@ -235,10 +237,10 @@ class TestClassWithNesting(val y: Int) extends Serializable {
     var nonSer = new NonSerializable
     var answer = 0
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       for (i <- 1 to 4) {
         var nonSer2 = new NonSerializable
-        var x = i
+        val x = i
         answer += nums.map(_ + x + getY).reduce(_ + _)
       }
       answer
@@ -266,13 +268,13 @@ private object TestUserClosuresActuallyCleaned {
     rdd.mapPartitionsWithIndex { (_, it) => return; it }.count()
   }
   def testZipPartitions2(rdd: RDD[Int]): Unit = {
-    rdd.zipPartitions(rdd) { case (it1, it2) => return; it1 }.count()
+    rdd.zipPartitions(rdd) { case (it1, _) => return; it1 }.count()
   }
   def testZipPartitions3(rdd: RDD[Int]): Unit = {
-    rdd.zipPartitions(rdd, rdd) { case (it1, it2, it3) => return; it1 }.count()
+    rdd.zipPartitions(rdd, rdd) { case (it1, _, _) => return; it1 }.count()
   }
   def testZipPartitions4(rdd: RDD[Int]): Unit = {
-    rdd.zipPartitions(rdd, rdd, rdd) { case (it1, it2, it3, it4) => return; it1 }.count()
+    rdd.zipPartitions(rdd, rdd, rdd) { case (it1, _, _, _) => return; it1 }.count()
   }
   def testForeach(rdd: RDD[Int]): Unit = { rdd.foreach { _ => return } }
   def testForeachPartition(rdd: RDD[Int]): Unit = { rdd.foreachPartition { _ => return } }
@@ -298,7 +300,7 @@ private object TestUserClosuresActuallyCleaned {
     rdd.aggregateByKey(0)({ case (_, _) => return; 1 }, { case (_, _) => return; 1 }).count()
   }
   def testFoldByKey(rdd: RDD[(Int, Int)]): Unit = { rdd.foldByKey(0) { case (_, _) => return; 1 } }
-  def testReduceByKey(rdd: RDD[(Int, Int)]): Unit = { rdd.reduceByKey { case (_, _) => return; 1 } }
+  def testReduceByKey(rdd: RDD[(Int, Int)]): Unit = { rdd.reduceByKey { (_, _) => return; 1 } }
   def testReduceByKeyLocally(rdd: RDD[(Int, Int)]): Unit = {
     rdd.reduceByKeyLocally { case (_, _) => return; 1 }
   }
@@ -312,17 +314,17 @@ private object TestUserClosuresActuallyCleaned {
   // Test SparkContext runJob
   def testRunJob1(sc: SparkContext): Unit = {
     val rdd = sc.parallelize(1 to 10, 10)
-    sc.runJob(rdd, { (ctx: TaskContext, iter: Iterator[Int]) => return; 1 } )
+    sc.runJob(rdd, { (_: TaskContext, _: Iterator[Int]) => return; 1 } )
   }
   def testRunJob2(sc: SparkContext): Unit = {
     val rdd = sc.parallelize(1 to 10, 10)
-    sc.runJob(rdd, { iter: Iterator[Int] => return; 1 } )
+    sc.runJob(rdd, { _: Iterator[Int] => return; 1 } )
   }
   def testRunApproximateJob(sc: SparkContext): Unit = {
     val rdd = sc.parallelize(1 to 10, 10)
     val evaluator = new CountEvaluator(1, 0.5)
     sc.runApproximateJob(
-      rdd, { (ctx: TaskContext, iter: Iterator[Int]) => return; 1L }, evaluator, 1000)
+      rdd, { (_: TaskContext, _: Iterator[Int]) => return; 1L }, evaluator, 1000)
   }
   def testSubmitJob(sc: SparkContext): Unit = {
     val rdd = sc.parallelize(1 to 10, 10)
@@ -338,7 +340,7 @@ private object TestUserClosuresActuallyCleaned {
 
 class TestCreateNullValue {
 
-  var x = 5
+  val x = 5
 
   def getX: Int = x
 
@@ -372,8 +374,23 @@ class TestCreateNullValue {
         println(getX)
       }
       // scalastyle:on println
-      ClosureCleaner.clean(closure)
+      SparkClosureCleaner.clean(closure)
     }
     nestedClosure()
   }
+}
+
+abstract class TestAbstractClass extends Serializable {
+  val n1 = 111
+  val s1 = "aaa"
+  protected val d1 = 1.0d
+
+  def run(): Seq[(Int, Int, String, String, Double, Double)]
+  def body(rdd: RDD[Int]): Seq[(Int, Int, String, String, Double, Double)]
+}
+
+abstract class TestAbstractClass2 extends Serializable {
+  val n1 = 111
+  val s1 = "aaa"
+  protected val d1 = 1.0d
 }

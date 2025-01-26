@@ -31,14 +31,22 @@ import org.apache.spark.sql.test.SQLTestUtils
 class HiveMetadataCacheSuite extends QueryTest with SQLTestUtils with TestHiveSingleton {
 
   test("SPARK-16337 temporary view refresh") {
-    withTempView("view_refresh") {
+    checkRefreshView(isTemp = true)
+  }
+
+  test("view refresh") {
+    checkRefreshView(isTemp = false)
+  }
+
+  private def checkRefreshView(isTemp: Boolean): Unit = {
+    withView("view_refresh") {
       withTable("view_table") {
         // Create a Parquet directory
         spark.range(start = 0, end = 100, step = 1, numPartitions = 3)
           .write.saveAsTable("view_table")
 
-        // Read the table in
-        spark.table("view_table").filter("id > -1").createOrReplaceTempView("view_refresh")
+        val temp = if (isTemp) "TEMPORARY" else ""
+        spark.sql(s"CREATE $temp VIEW view_refresh AS SELECT * FROM view_table WHERE id > -1")
         assert(sql("select count(*) from view_refresh").first().getLong(0) == 100)
 
         // Delete a file using the Hadoop file system interface since the path returned by
@@ -47,11 +55,13 @@ class HiveMetadataCacheSuite extends QueryTest with SQLTestUtils with TestHiveSi
         assert(p.getFileSystem(hiveContext.sessionState.newHadoopConf()).delete(p, false))
 
         // Read it again and now we should see a FileNotFoundException
-        val e = intercept[SparkException] {
-          sql("select count(*) from view_refresh").first()
-        }
-        assert(e.getMessage.contains("FileNotFoundException"))
-        assert(e.getMessage.contains("REFRESH"))
+        checkErrorMatchPVals(
+          exception = intercept[SparkException] {
+            sql("select count(*) from view_refresh").first()
+          },
+          condition = "FAILED_READ_FILE.FILE_NOT_EXIST",
+          parameters = Map("path" -> ".*")
+        )
 
         // Refresh and we should be able to read it again.
         spark.catalog.refreshTable("view_refresh")
@@ -88,10 +98,13 @@ class HiveMetadataCacheSuite extends QueryTest with SQLTestUtils with TestHiveSi
 
             // Delete a file, then assert that we tried to read it. This means the table was cached.
             deleteRandomFile()
-            val e = intercept[SparkException] {
-              sql("select * from test").count()
-            }
-            assert(e.getMessage.contains("FileNotFoundException"))
+            checkErrorMatchPVals(
+              exception = intercept[SparkException] {
+                sql("select * from test").count()
+              },
+              condition = "FAILED_READ_FILE.FILE_NOT_EXIST",
+              parameters = Map("path" -> ".*")
+            )
 
             // Test refreshing the cache.
             spark.catalog.refreshTable("test")
@@ -103,10 +116,13 @@ class HiveMetadataCacheSuite extends QueryTest with SQLTestUtils with TestHiveSi
             deleteRandomFile()
             spark.catalog.cacheTable("test")
             spark.catalog.refreshByPath("/some-invalid-path")  // no-op
-            val e2 = intercept[SparkException] {
-              sql("select * from test").count()
-            }
-            assert(e2.getMessage.contains("FileNotFoundException"))
+            checkErrorMatchPVals(
+              exception = intercept[SparkException] {
+                sql("select * from test").count()
+              },
+              condition = "FAILED_READ_FILE.FILE_NOT_EXIST",
+              parameters = Map("path" -> ".*")
+            )
             spark.catalog.refreshByPath(dir.getAbsolutePath)
             assert(sql("select * from test").count() == 3)
           }

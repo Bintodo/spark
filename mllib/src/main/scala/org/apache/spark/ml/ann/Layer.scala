@@ -361,17 +361,42 @@ private[ann] trait TopologyModel extends Serializable {
    * Forward propagation
    *
    * @param data input data
+   * @param includeLastLayer Include the last layer in the output. In
+   *                         MultilayerPerceptronClassifier, the last layer is always softmax;
+   *                         the last layer of outputs is needed for class predictions, but not
+   *                         for rawPrediction.
+   *
    * @return array of outputs for each of the layers
    */
-  def forward(data: BDM[Double]): Array[BDM[Double]]
+  def forward(data: BDM[Double], includeLastLayer: Boolean): Array[BDM[Double]]
 
   /**
-   * Prediction of the model
+   * Prediction of the model. See `ProbabilisticClassificationModel``
    *
-   * @param data input data
+   * @param features input features
    * @return prediction
    */
-  def predict(data: Vector): Vector
+  def predict(features: Vector): Vector
+
+  /**
+   * Raw prediction of the model. See `ProbabilisticClassificationModel`
+   *
+   * @param features input features
+   * @return raw prediction
+   *
+   * Note: This interface is only used for classification Model.
+   */
+  def predictRaw(features: Vector): Vector
+
+  /**
+   * Probability of the model. See `ProbabilisticClassificationModel`
+   *
+   * @param rawPrediction raw prediction vector
+   * @return probability
+   *
+   * Note: This interface is only used for classification Model.
+   */
+  def raw2ProbabilityInPlace(rawPrediction: Vector): Vector
 
   /**
    * Computes gradient for the network
@@ -455,7 +480,7 @@ private[ml] class FeedForwardModel private(
   val layers = topology.layers
   val layerModels = new Array[LayerModel](layers.length)
   private var offset = 0
-  for (i <- 0 until layers.length) {
+  for (i <- layers.indices) {
     layerModels(i) = layers(i).createModel(
       new BDV[Double](weights.toArray, offset, 1, layers(i).weightSize))
     offset += layers(i).weightSize
@@ -463,14 +488,14 @@ private[ml] class FeedForwardModel private(
   private var outputs: Array[BDM[Double]] = null
   private var deltas: Array[BDM[Double]] = null
 
-  override def forward(data: BDM[Double]): Array[BDM[Double]] = {
+  override def forward(data: BDM[Double], includeLastLayer: Boolean): Array[BDM[Double]] = {
     // Initialize output arrays for all layers. Special treatment for InPlace
     val currentBatchSize = data.cols
     // TODO: allocate outputs as one big array and then create BDMs from it
     if (outputs == null || outputs(0).cols != currentBatchSize) {
       outputs = new Array[BDM[Double]](layers.length)
       var inputSize = data.rows
-      for (i <- 0 until layers.length) {
+      for (i <- layers.indices) {
         if (layers(i).inPlace) {
           outputs(i) = outputs(i - 1)
         } else {
@@ -481,7 +506,8 @@ private[ml] class FeedForwardModel private(
       }
     }
     layerModels(0).eval(data, outputs(0))
-    for (i <- 1 until layerModels.length) {
+    val end = if (includeLastLayer) layerModels.length else layerModels.length - 1
+    for (i <- 1 until end) {
       layerModels(i).eval(outputs(i - 1), outputs(i))
     }
     outputs
@@ -492,7 +518,7 @@ private[ml] class FeedForwardModel private(
     target: BDM[Double],
     cumGradient: Vector,
     realBatchSize: Int): Double = {
-    val outputs = forward(data)
+    val outputs = forward(data, true)
     val currentBatchSize = data.cols
     // TODO: allocate deltas as one big array and then create BDMs from it
     if (deltas == null || deltas(0).cols != currentBatchSize) {
@@ -516,7 +542,7 @@ private[ml] class FeedForwardModel private(
     }
     val cumGradientArray = cumGradient.toArray
     var offset = 0
-    for (i <- 0 until layerModels.length) {
+    for (i <- layerModels.indices) {
       val input = if (i == 0) data else outputs(i - 1)
       layerModels(i).grad(deltas(i), input,
         new BDV[Double](cumGradientArray, offset, 1, layers(i).weightSize))
@@ -527,8 +553,19 @@ private[ml] class FeedForwardModel private(
 
   override def predict(data: Vector): Vector = {
     val size = data.size
-    val result = forward(new BDM[Double](size, 1, data.toArray))
+    val result = forward(new BDM[Double](size, 1, data.toArray), true)
     Vectors.dense(result.last.toArray)
+  }
+
+  override def predictRaw(data: Vector): Vector = {
+    val result = forward(new BDM[Double](data.size, 1, data.toArray), false)
+    Vectors.dense(result(result.length - 2).toArray)
+  }
+
+  override def raw2ProbabilityInPlace(data: Vector): Vector = {
+    val dataMatrix = new BDM[Double](data.size, 1, data.toArray)
+    layerModels.last.eval(dataMatrix, dataMatrix)
+    data
   }
 }
 
@@ -564,7 +601,7 @@ private[ann] object FeedForwardModel {
     val weights = BDV.zeros[Double](topology.layers.map(_.weightSize).sum)
     var offset = 0
     val random = new XORShiftRandom(seed)
-    for (i <- 0 until layers.length) {
+    for (i <- layers.indices) {
       layerModels(i) = layers(i).
         initModel(new BDV[Double](weights.data, offset, 1, layers(i).weightSize), random)
       offset += layers(i).weightSize
@@ -801,7 +838,7 @@ private[ml] class FeedForwardTrainer(
    * @param data RDD of input and output vector pairs
    * @return model
    */
-  def train(data: RDD[(Vector, Vector)]): TopologyModel = {
+  def train(data: RDD[(Vector, Vector)]): (TopologyModel, Array[Double]) = {
     val w = if (getWeights == null) {
       // TODO: will make a copy if vector is a subvector of BDV (see Vectors code)
       topology.model(_seed).weights
@@ -814,9 +851,14 @@ private[ml] class FeedForwardTrainer(
     }
     val handlePersistence = trainData.getStorageLevel == StorageLevel.NONE
     if (handlePersistence) trainData.persist(StorageLevel.MEMORY_AND_DISK)
-    val newWeights = optimizer.optimize(trainData, w)
+    val (newWeights, lossHistory) = optimizer match {
+      case lbfgs: LBFGS => lbfgs.optimizeWithLossReturned(trainData, w)
+      case sgd: GradientDescent => sgd.optimizeWithLossReturned(trainData, w)
+      case other => throw new UnsupportedOperationException(
+        s"Only LBFGS and GradientDescent are supported but got ${other.getClass}.")
+    }
     if (handlePersistence) trainData.unpersist()
-    topology.model(newWeights)
+    (topology.model(newWeights), lossHistory)
   }
 
 }

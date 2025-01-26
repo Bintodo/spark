@@ -19,16 +19,16 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import scala.annotation.tailrec
 
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+import org.apache.spark.sql.catalyst.planning.{NodeWithOnlyDeterministicProjectAndFilter, PhysicalOperation}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.internal.SQLConf
 
 /**
  * Encapsulates star-schema detection logic.
  */
-case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
+object StarSchemaDetection extends PredicateHelper with SQLConfHelper {
 
   /**
    * Star schema consists of one or more fact tables referencing a number of dimension
@@ -82,7 +82,8 @@ case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
       // Find if the input plans are eligible for star join detection.
       // An eligible plan is a base table access with valid statistics.
       val foundEligibleJoin = input.forall {
-        case PhysicalOperation(_, _, t: LeafNode) if t.stats(conf).rowCount.isDefined => true
+        case NodeWithOnlyDeterministicProjectAndFilter(t: LeafNode)
+            if t.stats.rowCount.isDefined => true
         case _ => false
       }
 
@@ -177,19 +178,19 @@ case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
   private def isUnique(
       column: Attribute,
       plan: LogicalPlan): Boolean = plan match {
-    case PhysicalOperation(_, _, t: LeafNode) =>
+    case NodeWithOnlyDeterministicProjectAndFilter(t: LeafNode) =>
       val leafCol = findLeafNodeCol(column, plan)
       leafCol match {
         case Some(col) if t.outputSet.contains(col) =>
-          val stats = t.stats(conf)
+          val stats = t.stats
           stats.rowCount match {
             case Some(rowCount) if rowCount >= 0 =>
               if (stats.attributeStats.nonEmpty && stats.attributeStats.contains(col)) {
-                val colStats = stats.attributeStats.get(col)
-                if (colStats.get.nullCount > 0) {
+                val colStats = stats.attributeStats.get(col).get
+                if (!colStats.hasCountStats || colStats.nullCount.get > 0) {
                   false
                 } else {
-                  val distinctCount = colStats.get.distinctCount
+                  val distinctCount = colStats.distinctCount.get
                   val relDiff = math.abs((distinctCount.toDouble / rowCount.toDouble) - 1.0d)
                   // ndvMaxErr adjusted based on TPCDS 1TB data results
                   relDiff <= conf.ndvMaxError * 2
@@ -197,9 +198,9 @@ case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
               } else {
                 false
               }
-            case None => false
+            case _ => false
           }
-        case None => false
+        case _ => false
       }
     case _ => false
   }
@@ -212,7 +213,7 @@ case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
   private def findLeafNodeCol(
       column: Attribute,
       plan: LogicalPlan): Option[Attribute] = plan match {
-    case pl @ PhysicalOperation(_, _, _: LeafNode) =>
+    case pl @ NodeWithOnlyDeterministicProjectAndFilter(_: LeafNode) =>
       pl match {
         case t: LeafNode if t.outputSet.contains(column) =>
           Option(column)
@@ -233,13 +234,13 @@ case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
   private def hasStatistics(
       column: Attribute,
       plan: LogicalPlan): Boolean = plan match {
-    case PhysicalOperation(_, _, t: LeafNode) =>
+    case NodeWithOnlyDeterministicProjectAndFilter(t: LeafNode) =>
       val leafCol = findLeafNodeCol(column, plan)
       leafCol match {
         case Some(col) if t.outputSet.contains(col) =>
-          val stats = t.stats(conf)
+          val stats = t.stats
           stats.attributeStats.nonEmpty && stats.attributeStats.contains(col)
-        case None => false
+        case _ => false
       }
     case _ => false
   }
@@ -296,11 +297,11 @@ case class StarSchemaDetection(conf: SQLConf) extends PredicateHelper {
    */
   private def getTableAccessCardinality(
       input: LogicalPlan): Option[BigInt] = input match {
-    case PhysicalOperation(_, cond, t: LeafNode) if t.stats(conf).rowCount.isDefined =>
-      if (conf.cboEnabled && input.stats(conf).rowCount.isDefined) {
-        Option(input.stats(conf).rowCount.get)
+    case NodeWithOnlyDeterministicProjectAndFilter(t: LeafNode) if t.stats.rowCount.isDefined =>
+      if (conf.cboEnabled && input.stats.rowCount.isDefined) {
+        Option(input.stats.rowCount.get)
       } else {
-        Option(t.stats(conf).rowCount.get)
+        Option(t.stats.rowCount.get)
       }
     case _ => None
   }
