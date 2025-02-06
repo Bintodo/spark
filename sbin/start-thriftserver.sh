@@ -39,6 +39,10 @@ function usage {
   pattern+="\|Spark Command: "
   pattern+="\|======="
   pattern+="\|--help"
+  pattern+="\|Using Spark's default log4j profile:"
+  pattern+="\|^log4j:"
+  pattern+="\|Started daemon with process name"
+  pattern+="\|Registered signal handler for"
 
   "${SPARK_HOME}"/bin/spark-submit --help 2>&1 | grep -v Usage 1>&2
   echo

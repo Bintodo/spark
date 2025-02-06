@@ -19,11 +19,12 @@ package org.apache.spark.sql.execution.streaming
 
 import scala.util.control.Exception._
 
-import org.json4s.NoTypeHints
+import org.json4s.{Formats, NoTypeHints}
 import org.json4s.jackson.Serialization
 
 /**
  * Offset for the [[FileStreamSource]].
+ *
  * @param logOffset  Position in the [[FileStreamSourceLog]]
  */
 case class FileStreamSourceOffset(logOffset: Long) extends Offset {
@@ -33,7 +34,7 @@ case class FileStreamSourceOffset(logOffset: Long) extends Offset {
 }
 
 object FileStreamSourceOffset {
-  implicit val format = Serialization.formats(NoTypeHints)
+  implicit val format: Formats = Serialization.formats(NoTypeHints)
 
   def apply(offset: Offset): FileStreamSourceOffset = {
     offset match {

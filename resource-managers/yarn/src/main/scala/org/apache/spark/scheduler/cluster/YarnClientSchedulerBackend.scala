@@ -17,15 +17,20 @@
 
 package org.apache.spark.scheduler.cluster
 
+import java.io.InterruptedIOException
+
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.hadoop.yarn.api.records.YarnApplicationState
+import org.apache.hadoop.yarn.api.records.{FinalApplicationStatus, YarnApplicationState}
 
 import org.apache.spark.{SparkContext, SparkException}
-import org.apache.spark.deploy.yarn.{Client, ClientArguments, YarnSparkHadoopUtil}
-import org.apache.spark.internal.Logging
+import org.apache.spark.deploy.yarn.{Client, ClientArguments, YarnAppReport}
+import org.apache.spark.deploy.yarn.config._
+import org.apache.spark.internal.{config, Logging, LogKeys, MDC}
+import org.apache.spark.internal.LogKeys.{APP_ID, APP_STATE}
 import org.apache.spark.launcher.SparkAppHandle
 import org.apache.spark.scheduler.TaskSchedulerImpl
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 
 private[spark] class YarnClientSchedulerBackend(
     scheduler: TaskSchedulerImpl,
@@ -40,35 +45,30 @@ private[spark] class YarnClientSchedulerBackend(
    * Create a Yarn client to submit an application to the ResourceManager.
    * This waits until the application is running.
    */
-  override def start() {
-    val driverHost = conf.get("spark.driver.host")
-    val driverPort = conf.get("spark.driver.port")
+  override def start(): Unit = {
+    super.start()
+
+    val driverHost = conf.get(config.DRIVER_HOST_ADDRESS)
+    val driverPort = conf.get(config.DRIVER_PORT)
     val hostport = driverHost + ":" + driverPort
-    sc.ui.foreach { ui => conf.set("spark.driver.appUIAddress", ui.webUrl) }
+    sc.ui.foreach { ui => conf.set(DRIVER_APP_UI_ADDRESS, ui.webUrl) }
 
     val argsArrayBuf = new ArrayBuffer[String]()
-    argsArrayBuf += ("--arg", hostport)
+    argsArrayBuf += "--arg" += hostport
 
     logDebug("ClientArguments called with: " + argsArrayBuf.mkString(" "))
     val args = new ClientArguments(argsArrayBuf.toArray)
-    totalExpectedExecutors = YarnSparkHadoopUtil.getInitialTargetExecutorNumber(conf)
-    client = new Client(args, conf)
-    bindToYarn(client.submitApplication(), None)
+    totalExpectedExecutors = SchedulerBackendUtils.getInitialTargetExecutorNumber(conf)
+    client = new Client(args, conf, sc.env.rpcEnv)
+    client.submitApplication()
+    bindToYarn(client.getApplicationId(), None)
 
-    // SPARK-8687: Ensure all necessary properties have already been set before
-    // we initialize our driver scheduler backend, which serves these properties
-    // to the executors
-    super.start()
     waitForApplication()
 
-    // SPARK-8851: In yarn-client mode, the AM still does the credentials refresh. The driver
-    // reads the credentials from HDFS, just like the executors and updates its own credentials
-    // cache.
-    if (conf.contains("spark.yarn.credentials.file")) {
-      YarnSparkHadoopUtil.get.startCredentialUpdater(conf)
-    }
     monitorThread = asyncMonitorApplication()
     monitorThread.start()
+
+    startBindings()
   }
 
   /**
@@ -77,16 +77,29 @@ private[spark] class YarnClientSchedulerBackend(
    * This assumes both `client` and `appId` have already been set.
    */
   private def waitForApplication(): Unit = {
+    val monitorInterval = conf.get(CLIENT_LAUNCH_MONITOR_INTERVAL)
+
     assert(client != null && appId.isDefined, "Application has not been submitted yet!")
-    val (state, _) = client.monitorApplication(appId.get, returnOnRunning = true) // blocking
+    val YarnAppReport(state, _, diags) =
+      client.monitorApplication(returnOnRunning = true, interval = monitorInterval)
     if (state == YarnApplicationState.FINISHED ||
-      state == YarnApplicationState.FAILED ||
-      state == YarnApplicationState.KILLED) {
-      throw new SparkException("Yarn application has already ended! " +
-        "It might have been killed or unable to launch application master.")
+        state == YarnApplicationState.FAILED ||
+        state == YarnApplicationState.KILLED) {
+      val genericMessage = "The YARN application has already ended! " +
+        "It might have been killed or the Application Master may have failed to start. " +
+        "Check the YARN application logs for more details."
+      val exceptionMsg = diags match {
+        case Some(msg) =>
+          logError(genericMessage)
+          msg
+
+        case None =>
+          genericMessage
+      }
+      throw new SparkException(exceptionMsg)
     }
     if (state == YarnApplicationState.RUNNING) {
-      logInfo(s"Application ${appId.get} has started running.")
+      logInfo(log"Application ${MDC(APP_ID, appId.get)} has started running.")
     }
   }
 
@@ -100,14 +113,28 @@ private[spark] class YarnClientSchedulerBackend(
   private class MonitorThread extends Thread {
     private var allowInterrupt = true
 
-    override def run() {
+    override def run(): Unit = {
       try {
-        val (state, _) = client.monitorApplication(appId.get, logApplicationReport = false)
-        logError(s"Yarn application has already exited with state $state!")
+        val YarnAppReport(_, state, diags) =
+          client.monitorApplication(logApplicationReport = false)
+        logError(log"YARN application has exited unexpectedly with state " +
+          log"${MDC(APP_STATE, state)}! Check the YARN application logs for more details.")
+        diags.foreach { err =>
+          logError(log"Diagnostics message: ${MDC(LogKeys.ERROR, err)}")
+        }
         allowInterrupt = false
         sc.stop()
+        state match {
+          case FinalApplicationStatus.FAILED | FinalApplicationStatus.KILLED
+            if conf.get(AM_CLIENT_MODE_EXIT_ON_ERROR) =>
+            logWarning(log"ApplicationMaster finished with status ${MDC(APP_STATE, state)}, " +
+              log"SparkContext should exit with code 1.")
+            System.exit(1)
+          case _ =>
+        }
       } catch {
-        case e: InterruptedException => logInfo("Interrupting monitor thread")
+        case _: InterruptedException | _: InterruptedIOException =>
+          logInfo("Interrupting monitor thread")
       }
     }
 
@@ -126,7 +153,7 @@ private[spark] class YarnClientSchedulerBackend(
   private def asyncMonitorApplication(): MonitorThread = {
     assert(client != null && appId.isDefined, "Application has not been submitted yet!")
     val t = new MonitorThread
-    t.setName("Yarn application state monitor")
+    t.setName("YARN application state monitor")
     t.setDaemon(true)
     t
   }
@@ -134,8 +161,9 @@ private[spark] class YarnClientSchedulerBackend(
   /**
    * Stop the scheduler. This assumes `start()` has already been called.
    */
-  override def stop() {
+  override def stop(exitCode: Int): Unit = {
     assert(client != null, "Attempted to stop this scheduler before starting it!")
+    yarnSchedulerEndpoint.signalDriverStop(exitCode)
     if (monitorThread != null) {
       monitorThread.stopMonitor()
     }
@@ -149,9 +177,13 @@ private[spark] class YarnClientSchedulerBackend(
     client.reportLauncherState(SparkAppHandle.State.FINISHED)
 
     super.stop()
-    YarnSparkHadoopUtil.get.stopCredentialUpdater()
     client.stop()
-    logInfo("Stopped")
+    logInfo("YARN client scheduler backend Stopped")
+  }
+
+  override protected def updateDelegationTokens(tokens: Array[Byte]): Unit = {
+    super.updateDelegationTokens(tokens)
+    amEndpoint.foreach(_.send(UpdateDelegationTokens(tokens)))
   }
 
 }

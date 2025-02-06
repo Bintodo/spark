@@ -19,14 +19,17 @@ package org.apache.spark.sql.execution.aggregate
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction}
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.util.UnsafeRowUtils
 import org.apache.spark.sql.execution.metric.SQLMetric
 
 /**
- * An iterator used to evaluate [[AggregateFunction]]. It assumes the input rows have been
- * sorted by values of [[groupingExpressions]].
+ * An iterator used to evaluate
+ * [[org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction]].
+ * It assumes the input rows have been sorted by values of [[groupingExpressions]].
  */
 class SortBasedAggregationIterator(
+    partIndex: Int,
     groupingExpressions: Seq[NamedExpression],
     valueAttributes: Seq[Attribute],
     inputIterator: Iterator[InternalRow],
@@ -37,6 +40,7 @@ class SortBasedAggregationIterator(
     newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
     numOutputRows: SQLMetric)
   extends AggregationIterator(
+    partIndex,
     groupingExpressions,
     valueAttributes,
     aggregateExpressions,
@@ -86,16 +90,7 @@ class SortBasedAggregationIterator(
   // The aggregation buffer used by the sort-based aggregation.
   private[this] val sortBasedAggregationBuffer: InternalRow = newBuffer
 
-  // This safe projection is used to turn the input row into safe row. This is necessary
-  // because the input row may be produced by unsafe projection in child operator and all the
-  // produced rows share one byte array. However, when we update the aggregate buffer according to
-  // the input row, we may cache some values from input row, e.g. `Max` will keep the max value from
-  // input row via MutableProjection, `CollectList` will keep all values in an array via
-  // ImperativeAggregate framework. These values may get changed unexpectedly if the underlying
-  // unsafe projection update the shared byte array. By applying a safe projection to the input row,
-  // we can cut down the connection from input row to the shared byte array, and thus it's safe to
-  // cache values from input row while updating the aggregation buffer.
-  private[this] val safeProj: Projection = FromUnsafeProjection(valueAttributes.map(_.dataType))
+  private[this] var groupKeyEqualityCheck: (UnsafeRow, UnsafeRow) => Boolean = _
 
   protected def initialize(): Unit = {
     if (inputIterator.hasNext) {
@@ -108,6 +103,15 @@ class SortBasedAggregationIterator(
       // This inputIter is empty.
       sortedInputHasNewGroup = false
     }
+
+    groupKeyEqualityCheck =
+      if (groupingExpressions.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType))) {
+        (key1: UnsafeRow, key2: UnsafeRow) => key1.equals(key2)
+      } else {
+        val types = groupingAttributes.map(_.dataType).toIndexedSeq
+        val ordering = InterpretedOrdering.forSchema(types)
+        (key1: UnsafeRow, key2: UnsafeRow) => ordering.compare(key1, key2) == 0
+      }
   }
 
   initialize()
@@ -119,7 +123,7 @@ class SortBasedAggregationIterator(
     // We create a variable to track if we see the next group.
     var findNextPartition = false
     // firstRowInNextGroup is the first row of this group. We first process it.
-    processRow(sortBasedAggregationBuffer, safeProj(firstRowInNextGroup))
+    processRow(sortBasedAggregationBuffer, firstRowInNextGroup)
 
     // The search will stop when we see the next group or there is no
     // input row left in the iter.
@@ -129,8 +133,8 @@ class SortBasedAggregationIterator(
       val groupingKey = groupingProjection(currentRow)
 
       // Check if the current row belongs the current input row.
-      if (currentGroupingKey == groupingKey) {
-        processRow(sortBasedAggregationBuffer, safeProj(currentRow))
+      if (groupKeyEqualityCheck(currentGroupingKey, groupingKey)) {
+        processRow(sortBasedAggregationBuffer, currentRow)
       } else {
         // We find a new group.
         findNextPartition = true
