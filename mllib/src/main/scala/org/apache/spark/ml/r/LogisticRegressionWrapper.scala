@@ -25,10 +25,11 @@ import org.json4s.jackson.JsonMethods._
 import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.ml.classification.{LogisticRegression, LogisticRegressionModel}
 import org.apache.spark.ml.feature.{IndexToString, RFormula}
-import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.linalg.{Matrices, Vector, Vectors}
 import org.apache.spark.ml.r.RWrapperUtils._
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.util.ArrayImplicits._
 
 private[r] class LogisticRegressionWrapper private (
     val pipeline: PipelineModel,
@@ -97,12 +98,20 @@ private[r] object LogisticRegressionWrapper
       standardization: Boolean,
       thresholds: Array[Double],
       weightCol: String,
-      aggregationDepth: Int
+      aggregationDepth: Int,
+      numRowsOfBoundsOnCoefficients: Int,
+      numColsOfBoundsOnCoefficients: Int,
+      lowerBoundsOnCoefficients: Array[Double],
+      upperBoundsOnCoefficients: Array[Double],
+      lowerBoundsOnIntercepts: Array[Double],
+      upperBoundsOnIntercepts: Array[Double],
+      handleInvalid: String
       ): LogisticRegressionWrapper = {
 
     val rFormula = new RFormula()
       .setFormula(formula)
       .setForceIndexLabel(true)
+      .setHandleInvalid(handleInvalid)
     checkDataColumns(rFormula, data)
     val rFormulaModel = rFormula.fit(data)
 
@@ -133,6 +142,30 @@ private[r] object LogisticRegressionWrapper
 
     if (weightCol != null) lr.setWeightCol(weightCol)
 
+    if (numRowsOfBoundsOnCoefficients != 0 &&
+      numColsOfBoundsOnCoefficients != 0 && lowerBoundsOnCoefficients != null) {
+      val coef = Matrices.dense(numRowsOfBoundsOnCoefficients,
+        numColsOfBoundsOnCoefficients, lowerBoundsOnCoefficients)
+      lr.setLowerBoundsOnCoefficients(coef)
+    }
+
+    if (numRowsOfBoundsOnCoefficients != 0 &&
+      numColsOfBoundsOnCoefficients != 0 && upperBoundsOnCoefficients != null) {
+      val coef = Matrices.dense(numRowsOfBoundsOnCoefficients,
+        numColsOfBoundsOnCoefficients, upperBoundsOnCoefficients)
+      lr.setUpperBoundsOnCoefficients(coef)
+    }
+
+    if (lowerBoundsOnIntercepts != null) {
+      val intercept = Vectors.dense(lowerBoundsOnIntercepts)
+      lr.setLowerBoundsOnIntercepts(intercept)
+    }
+
+    if (upperBoundsOnIntercepts != null) {
+      val intercept = Vectors.dense(upperBoundsOnIntercepts)
+      lr.setUpperBoundsOnIntercepts(intercept)
+    }
+
     val idxToStr = new IndexToString()
       .setInputCol(PREDICTED_LABEL_INDEX_COL)
       .setOutputCol(PREDICTED_LABEL_COL)
@@ -156,10 +189,12 @@ private[r] object LogisticRegressionWrapper
       val pipelinePath = new Path(path, "pipeline").toString
 
       val rMetadata = ("class" -> instance.getClass.getName) ~
-        ("features" -> instance.features.toSeq) ~
-        ("labels" -> instance.labels.toSeq)
+        ("features" -> instance.features.toImmutableArraySeq) ~
+        ("labels" -> instance.labels.toImmutableArraySeq)
       val rMetadataJson: String = compact(render(rMetadata))
-      sc.parallelize(Seq(rMetadataJson), 1).saveAsTextFile(rMetadataPath)
+      // Note that we should write single file. If there are more than one row
+      // it produces more partitions.
+      sparkSession.createDataFrame(Seq(Tuple1(rMetadataJson))).write.text(rMetadataPath)
 
       instance.pipeline.save(pipelinePath)
     }
@@ -172,7 +207,8 @@ private[r] object LogisticRegressionWrapper
       val rMetadataPath = new Path(path, "rMetadata").toString
       val pipelinePath = new Path(path, "pipeline").toString
 
-      val rMetadataStr = sc.textFile(rMetadataPath, 1).first()
+      val rMetadataStr = sparkSession.read.text(rMetadataPath)
+        .first().getString(0)
       val rMetadata = parse(rMetadataStr)
       val features = (rMetadata \ "features").extract[Array[String]]
       val labels = (rMetadata \ "labels").extract[Array[String]]

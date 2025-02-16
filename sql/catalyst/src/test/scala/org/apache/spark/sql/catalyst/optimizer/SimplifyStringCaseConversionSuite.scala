@@ -20,8 +20,8 @@ package org.apache.spark.sql.catalyst.optimizer
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.PlanTest
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 
 class SimplifyStringCaseConversionSuite extends PlanTest {
@@ -32,17 +32,17 @@ class SimplifyStringCaseConversionSuite extends PlanTest {
         SimplifyCaseConversionExpressions) :: Nil
   }
 
-  val testRelation = LocalRelation('a.string)
+  val testRelation = LocalRelation($"a".string)
 
   test("simplify UPPER(UPPER(str))") {
     val originalQuery =
       testRelation
-        .select(Upper(Upper('a)) as 'u)
+        .select(Upper(Upper($"a")) as "u")
 
     val optimized = Optimize.execute(originalQuery.analyze)
     val correctAnswer =
       testRelation
-        .select(Upper('a) as 'u)
+        .select(Upper($"a") as "u")
         .analyze
 
     comparePlans(optimized, correctAnswer)
@@ -51,12 +51,12 @@ class SimplifyStringCaseConversionSuite extends PlanTest {
   test("simplify UPPER(LOWER(str))") {
     val originalQuery =
       testRelation
-        .select(Upper(Lower('a)) as 'u)
+        .select(Upper(Lower($"a")) as "u")
 
     val optimized = Optimize.execute(originalQuery.analyze)
     val correctAnswer =
       testRelation
-        .select(Upper('a) as 'u)
+        .select(Upper($"a") as "u")
         .analyze
 
     comparePlans(optimized, correctAnswer)
@@ -65,11 +65,11 @@ class SimplifyStringCaseConversionSuite extends PlanTest {
   test("simplify LOWER(UPPER(str))") {
     val originalQuery =
       testRelation
-        .select(Lower(Upper('a)) as 'l)
+        .select(Lower(Upper($"a")) as "l")
 
     val optimized = Optimize.execute(originalQuery.analyze)
     val correctAnswer = testRelation
-      .select(Lower('a) as 'l)
+      .select(Lower($"a") as "l")
       .analyze
 
     comparePlans(optimized, correctAnswer)
@@ -78,11 +78,11 @@ class SimplifyStringCaseConversionSuite extends PlanTest {
   test("simplify LOWER(LOWER(str))") {
     val originalQuery =
       testRelation
-        .select(Lower(Lower('a)) as 'l)
+        .select(Lower(Lower($"a")) as "l")
 
     val optimized = Optimize.execute(originalQuery.analyze)
     val correctAnswer = testRelation
-      .select(Lower('a) as 'l)
+      .select(Lower($"a") as "l")
       .analyze
 
     comparePlans(optimized, correctAnswer)

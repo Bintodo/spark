@@ -28,11 +28,11 @@ import org.apache.spark.network.shuffle.protocol.ExecutorShuffleInfo;
 import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
 import org.apache.spark.network.shuffle.ExternalShuffleBlockResolver.AppExecId;
-import org.junit.AfterClass;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class ExternalShuffleBlockResolverSuite {
   private static final String sortBlock0 = "Hello!";
@@ -44,7 +44,7 @@ public class ExternalShuffleBlockResolverSuite {
   private static final TransportConf conf =
       new TransportConf("shuffle", MapConfigProvider.EMPTY);
 
-  @BeforeClass
+  @BeforeAll
   public static void beforeAll() throws IOException {
     dataContext = new TestShuffleDataContext(2, 5);
 
@@ -55,7 +55,7 @@ public class ExternalShuffleBlockResolverSuite {
         sortBlock1.getBytes(StandardCharsets.UTF_8)});
   }
 
-  @AfterClass
+  @AfterAll
   public static void afterAll() {
     dataContext.cleanup();
   }
@@ -64,31 +64,15 @@ public class ExternalShuffleBlockResolverSuite {
   public void testBadRequests() throws IOException {
     ExternalShuffleBlockResolver resolver = new ExternalShuffleBlockResolver(conf, null);
     // Unregistered executor
-    try {
-      resolver.getBlockData("app0", "exec1", "shuffle_1_1_0");
-      fail("Should have failed");
-    } catch (RuntimeException e) {
-      assertTrue("Bad error message: " + e, e.getMessage().contains("not registered"));
-    }
-
-    // Invalid shuffle manager
-    try {
-      resolver.registerExecutor("app0", "exec2", dataContext.createExecutorInfo("foobar"));
-      resolver.getBlockData("app0", "exec2", "shuffle_1_1_0");
-      fail("Should have failed");
-    } catch (UnsupportedOperationException e) {
-      // pass
-    }
+    RuntimeException e = assertThrows(RuntimeException.class,
+      () -> resolver.getBlockData("app0", "exec1", 1, 1, 0));
+    assertTrue(e.getMessage().contains("not registered"), "Bad error message: " + e);
 
     // Nonexistent shuffle block
     resolver.registerExecutor("app0", "exec3",
       dataContext.createExecutorInfo(SORT_MANAGER));
-    try {
-      resolver.getBlockData("app0", "exec3", "shuffle_1_1_0");
-      fail("Should have failed");
-    } catch (Exception e) {
-      // pass
-    }
+    assertThrows(Exception.class,
+      () -> resolver.getBlockData("app0", "exec3", 1, 1, 0));
   }
 
   @Test
@@ -97,19 +81,26 @@ public class ExternalShuffleBlockResolverSuite {
     resolver.registerExecutor("app0", "exec0",
       dataContext.createExecutorInfo(SORT_MANAGER));
 
-    InputStream block0Stream =
-      resolver.getBlockData("app0", "exec0", "shuffle_0_0_0").createInputStream();
-    String block0 = CharStreams.toString(
-        new InputStreamReader(block0Stream, StandardCharsets.UTF_8));
-    block0Stream.close();
-    assertEquals(sortBlock0, block0);
+    try (InputStream block0Stream = resolver.getBlockData(
+        "app0", "exec0", 0, 0, 0).createInputStream()) {
+      String block0 =
+        CharStreams.toString(new InputStreamReader(block0Stream, StandardCharsets.UTF_8));
+      assertEquals(sortBlock0, block0);
+    }
 
-    InputStream block1Stream =
-      resolver.getBlockData("app0", "exec0", "shuffle_0_0_1").createInputStream();
-    String block1 = CharStreams.toString(
-        new InputStreamReader(block1Stream, StandardCharsets.UTF_8));
-    block1Stream.close();
-    assertEquals(sortBlock1, block1);
+    try (InputStream block1Stream = resolver.getBlockData(
+        "app0", "exec0", 0, 0, 1).createInputStream()) {
+      String block1 =
+        CharStreams.toString(new InputStreamReader(block1Stream, StandardCharsets.UTF_8));
+      assertEquals(sortBlock1, block1);
+    }
+
+    try (InputStream blocksStream = resolver.getContinuousBlocksData(
+        "app0", "exec0", 0, 0, 0, 2).createInputStream()) {
+      String blocks =
+        CharStreams.toString(new InputStreamReader(blocksStream, StandardCharsets.UTF_8));
+      assertEquals(sortBlock0 + sortBlock1, blocks);
+    }
   }
 
   @Test
@@ -127,7 +118,7 @@ public class ExternalShuffleBlockResolverSuite {
       mapper.readValue(shuffleJson, ExecutorShuffleInfo.class);
     assertEquals(parsedShuffleInfo, shuffleInfo);
 
-    // Intentionally keep these hard-coded strings in here, to check backwards-compatability.
+    // Intentionally keep these hard-coded strings in here, to check backwards-compatibility.
     // its not legacy yet, but keeping this here in case anybody changes it
     String legacyAppIdJson = "{\"appId\":\"foo\", \"execId\":\"bar\"}";
     assertEquals(appId, mapper.readValue(legacyAppIdJson, AppExecId.class));
@@ -135,4 +126,5 @@ public class ExternalShuffleBlockResolverSuite {
       "\"subDirsPerLocalDir\": 7, \"shuffleManager\": " + "\"" + SORT_MANAGER + "\"}";
     assertEquals(shuffleInfo, mapper.readValue(legacyShuffleJson, ExecutorShuffleInfo.class));
   }
+
 }
