@@ -19,24 +19,26 @@ package org.apache.spark.sql.execution.window
 
 import scala.collection.mutable
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
  * This class prepares and manages the processing of a number of [[AggregateFunction]]s within a
- * single frame. The [[WindowFunctionFrame]] takes care of processing the frame in the correct way,
- * this reduces the processing of a [[AggregateWindowFunction]] to processing the underlying
+ * single frame. The [[WindowFunctionFrame]] takes care of processing the frame in the correct way
+ * that reduces the processing of a [[AggregateWindowFunction]] to processing the underlying
  * [[AggregateFunction]]. All [[AggregateFunction]]s are processed in [[Complete]] mode.
  *
  * [[SizeBasedWindowFunction]]s are initialized in a slightly different way. These functions
- * require the size of the partition processed, this value is exposed to them when the processor is
- * constructed.
+ * require the size of the partition processed and this value is exposed to them when
+ * the processor is constructed.
  *
  * Processing of distinct aggregates is currently not supported.
  *
- * The implementation is split into an object which takes care of construction, and a the actual
+ * The implementation is split into an object which takes care of construction, and the actual
  * processor class.
  */
 private[window] object AggregateProcessor {
@@ -90,13 +92,14 @@ private[window] object AggregateProcessor {
         updateExpressions ++= noOps
         evaluateExpressions += imperative
       case other =>
-        sys.error(s"Unsupported Aggregate Function: $other")
+        throw SparkException.internalError(s"Unsupported aggregate function: $other")
     }
 
     // Create the projections.
-    val initialProj = newMutableProjection(initialValues, partitionSize.toSeq)
-    val updateProj = newMutableProjection(updateExpressions, aggBufferAttributes ++ inputAttributes)
-    val evalProj = newMutableProjection(evaluateExpressions, aggBufferAttributes)
+    val initialProj = newMutableProjection(initialValues.toSeq, partitionSize.toSeq)
+    val updateProj =
+      newMutableProjection(updateExpressions.toSeq, (aggBufferAttributes ++ inputAttributes).toSeq)
+    val evalProj = newMutableProjection(evaluateExpressions.toSeq, aggBufferAttributes.toSeq)
 
     // Create the processor
     new AggregateProcessor(
@@ -123,7 +126,8 @@ private[window] final class AggregateProcessor(
 
   private[this] val join = new JoinedRow
   private[this] val numImperatives = imperatives.length
-  private[this] val buffer = new SpecificInternalRow(bufferSchema.toSeq.map(_.dataType))
+  private[this] val buffer =
+    new SpecificInternalRow(bufferSchema.toImmutableArraySeq.map(_.dataType))
   initialProjection.target(buffer)
   updateProjection.target(buffer)
 
@@ -154,6 +158,7 @@ private[window] final class AggregateProcessor(
   }
 
   /** Evaluate buffer. */
-  def evaluate(target: InternalRow): Unit =
-  evaluateProjection.target(target)(buffer)
+  def evaluate(target: InternalRow): Unit = {
+    evaluateProjection.target(target)(buffer)
+  }
 }

@@ -17,19 +17,17 @@
 
 package org.apache.spark.sql.hive
 
-import org.scalatest.BeforeAndAfterEach
-
 import org.apache.spark.sql._
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 
 /**
  * Run all tests from `SessionStateSuite` with a Hive based `SessionState`.
  */
-class HiveSessionStateSuite extends SessionStateSuite
-  with TestHiveSingleton with BeforeAndAfterEach {
+class HiveSessionStateSuite extends SessionStateSuite with TestHiveSingleton {
 
   override def beforeAll(): Unit = {
     // Reuse the singleton session
+    super.beforeAll()
     activeSession = spark
   }
 
@@ -37,5 +35,17 @@ class HiveSessionStateSuite extends SessionStateSuite
     // Set activeSession to null to avoid stopping the singleton session
     activeSession = null
     super.afterAll()
+  }
+
+  test("Clone then newSession") {
+    val sparkSession = hiveContext.sparkSession
+    val conf = sparkSession.sparkContext.hadoopConfiguration
+    val oldValue = conf.get("javax.jdo.option.ConnectionURL")
+    sparkSession.cloneSession()
+    sparkSession.sharedState.externalCatalog.unwrapped.asInstanceOf[HiveExternalCatalog]
+      .client.newSession()
+    val newValue = conf.get("javax.jdo.option.ConnectionURL")
+    assert(oldValue == newValue,
+      "cloneSession and then newSession should not affect the Derby directory")
   }
 }

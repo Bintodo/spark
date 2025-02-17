@@ -22,6 +22,7 @@ import scala.reflect.ClassTag
 import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.classic.ClassicConversions.castToImpl
 import org.apache.spark.sql.internal.SessionState
 import org.apache.spark.sql.types.StructType
 
@@ -32,53 +33,103 @@ package object state {
     /** Map each partition of an RDD along with data in a [[StateStore]]. */
     def mapPartitionsWithStateStore[U: ClassTag](
         sqlContext: SQLContext,
-        checkpointLocation: String,
-        operatorId: Long,
-        storeVersion: Long,
+        stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
-        valueSchema: StructType)(
+        valueSchema: StructType,
+        keyStateEncoderSpec: KeyStateEncoderSpec)(
         storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
 
       mapPartitionsWithStateStore(
-        checkpointLocation,
-        operatorId,
-        storeVersion,
+        stateInfo,
         keySchema,
         valueSchema,
-        sqlContext.sessionState,
-        Some(sqlContext.streams.stateStoreCoordinator))(
+        keyStateEncoderSpec,
+        sqlContext.sparkSession.sessionState,
+        Some(castToImpl(sqlContext.sparkSession).streams.stateStoreCoordinator))(
         storeUpdateFunction)
     }
 
+    // Disable scala style because num parameters exceeds the max limit used to enforce scala style
+    // scalastyle:off
     /** Map each partition of an RDD along with data in a [[StateStore]]. */
-    private[streaming] def mapPartitionsWithStateStore[U: ClassTag](
-        checkpointLocation: String,
-        operatorId: Long,
-        storeVersion: Long,
+    def mapPartitionsWithStateStore[U: ClassTag](
+        stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
+        keyStateEncoderSpec: KeyStateEncoderSpec,
         sessionState: SessionState,
-        storeCoordinator: Option[StateStoreCoordinatorRef])(
+        storeCoordinator: Option[StateStoreCoordinatorRef],
+        useColumnFamilies: Boolean = false,
+        extraOptions: Map[String, String] = Map.empty,
+        useMultipleValuesPerKey: Boolean = false)(
         storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
 
       val cleanedF = dataRDD.sparkContext.clean(storeUpdateFunction)
       val wrappedF = (store: StateStore, iter: Iterator[T]) => {
         // Abort the state store in case of error
-        TaskContext.get().addTaskCompletionListener(_ => {
+        TaskContext.get().addTaskCompletionListener[Unit](_ => {
           if (!store.hasCommitted) store.abort()
         })
         cleanedF(store, iter)
       }
+
       new StateStoreRDD(
         dataRDD,
         wrappedF,
-        checkpointLocation,
-        operatorId,
-        storeVersion,
+        stateInfo.checkpointLocation,
+        stateInfo.queryRunId,
+        stateInfo.operatorId,
+        stateInfo.storeVersion,
+        stateInfo.stateStoreCkptIds,
+        stateInfo.stateSchemaMetadata,
         keySchema,
         valueSchema,
+        keyStateEncoderSpec,
         sessionState,
-        storeCoordinator)
+        storeCoordinator,
+        useColumnFamilies,
+        extraOptions,
+        useMultipleValuesPerKey)
+    }
+    // scalastyle:on
+
+    /** Map each partition of an RDD along with data in a [[ReadStateStore]]. */
+    private[streaming] def mapPartitionsWithReadStateStore[U: ClassTag](
+        stateInfo: StatefulOperatorStateInfo,
+        keySchema: StructType,
+        valueSchema: StructType,
+        keyStateEncoderSpec: KeyStateEncoderSpec,
+        sessionState: SessionState,
+        storeCoordinator: Option[StateStoreCoordinatorRef],
+        useColumnFamilies: Boolean = false,
+        extraOptions: Map[String, String] = Map.empty)(
+        storeReadFn: (ReadStateStore, Iterator[T]) => Iterator[U])
+      : ReadStateStoreRDD[T, U] = {
+
+      val cleanedF = dataRDD.sparkContext.clean(storeReadFn)
+      val wrappedF = (store: ReadStateStore, iter: Iterator[T]) => {
+        // Clean up the state store.
+        TaskContext.get().addTaskCompletionListener[Unit](_ => {
+          store.abort()
+        })
+        cleanedF(store, iter)
+      }
+      new ReadStateStoreRDD(
+        dataRDD,
+        wrappedF,
+        stateInfo.checkpointLocation,
+        stateInfo.queryRunId,
+        stateInfo.operatorId,
+        stateInfo.storeVersion,
+        stateInfo.stateStoreCkptIds,
+        stateInfo.stateSchemaMetadata,
+        keySchema,
+        valueSchema,
+        keyStateEncoderSpec,
+        sessionState,
+        storeCoordinator,
+        useColumnFamilies,
+        extraOptions)
     }
   }
 }

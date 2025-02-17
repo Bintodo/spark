@@ -23,6 +23,7 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.catalog.CatalogUtils
+import org.apache.spark.sql.execution.datasources.orc.OrcCompressionCodec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.HadoopFsRelationTest
 import org.apache.spark.sql.types._
@@ -30,13 +31,14 @@ import org.apache.spark.sql.types._
 class OrcHadoopFsRelationSuite extends HadoopFsRelationTest {
   import testImplicits._
 
-  override val dataSourceName: String = classOf[OrcFileFormat].getCanonicalName
+  override protected val enableAutoThreadAudit = false
+  override val dataSourceName: String =
+    classOf[org.apache.spark.sql.execution.datasources.orc.OrcFileFormat].getCanonicalName
 
-  // ORC does not play well with NullType and UDT.
+  // ORC does not play well with NullType.
   override protected def supportsDataType(dataType: DataType): Boolean = dataType match {
     case _: NullType => false
     case _: CalendarIntervalType => false
-    case _: UserDefinedType[_] => false
     case _ => true
   }
 
@@ -97,7 +99,7 @@ class OrcHadoopFsRelationSuite extends HadoopFsRelationTest {
       val orcFilePath = maybeOrcFile.get.toPath.toString
       val expectedCompressionKind =
         OrcFileOperator.getFileReader(orcFilePath).get.getCompression
-      assert("ZLIB" === expectedCompressionKind.name())
+      assert(OrcCompressionCodec.ZLIB.name() === expectedCompressionKind.name())
 
       val copyDf = spark
         .read
@@ -105,14 +107,9 @@ class OrcHadoopFsRelationSuite extends HadoopFsRelationTest {
       checkAnswer(df, copyDf)
     }
   }
+}
 
-  test("Default compression codec is snappy for ORC compression") {
-    withTempPath { file =>
-      spark.range(0, 10).write
-        .orc(file.getCanonicalPath)
-      val expectedCompressionKind =
-        OrcFileOperator.getFileReader(file.getCanonicalPath).get.getCompression
-      assert("SNAPPY" === expectedCompressionKind.name())
-    }
-  }
+class HiveOrcHadoopFsRelationSuite extends OrcHadoopFsRelationSuite {
+  override val dataSourceName: String =
+    classOf[org.apache.spark.sql.hive.orc.OrcFileFormat].getCanonicalName
 }

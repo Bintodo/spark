@@ -17,15 +17,15 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.{util => ju}
-
-import scala.collection.mutable
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 
 import com.codahale.metrics.{Gauge, MetricRegistry}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.source.{Source => CodahaleSource}
-import org.apache.spark.util.Clock
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.streaming.StreamingQueryProgress
 
 /**
  * Serves metrics from a [[org.apache.spark.sql.streaming.StreamingQuery]] to
@@ -39,14 +39,37 @@ class MetricsReporter(
 
   // Metric names should not have . in them, so that all the metrics of a query are identified
   // together in Ganglia as a single metric group
-  registerGauge("inputRate-total", () => stream.lastProgress.inputRowsPerSecond)
-  registerGauge("processingRate-total", () => stream.lastProgress.inputRowsPerSecond)
-  registerGauge("latency", () => stream.lastProgress.durationMs.get("triggerExecution").longValue())
+  registerGauge("inputRate-total", _.inputRowsPerSecond, 0.0)
+  registerGauge("processingRate-total", _.processedRowsPerSecond, 0.0)
+  registerGauge("latency", _.durationMs.getOrDefault("triggerExecution", 0L).longValue(), 0L)
 
-  private def registerGauge[T](name: String, f: () => T)(implicit num: Numeric[T]): Unit = {
+  private val timestampFormat =
+    DateTimeFormatter
+      .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") // ISO8601
+      .withZone(DateTimeUtils.getZoneId("UTC"))
+
+  registerGauge("eventTime-watermark",
+    progress => convertStringDateToMillis(progress.eventTime.get("watermark")), 0L)
+
+  registerGauge("states-rowsTotal", _.stateOperators.map(_.numRowsTotal).sum, 0L)
+  registerGauge("states-usedBytes", _.stateOperators.map(_.memoryUsedBytes).sum, 0L)
+
+  private def convertStringDateToMillis(isoUtcDateStr: String) = {
+    if (isoUtcDateStr != null) {
+      val zonedDateTime = ZonedDateTime.parse(isoUtcDateStr, timestampFormat)
+      zonedDateTime.toInstant.toEpochMilli
+    } else {
+      0L
+    }
+  }
+
+  private def registerGauge[T](
+      name: String,
+      f: StreamingQueryProgress => T,
+      default: T): Unit = {
     synchronized {
       metricRegistry.register(name, new Gauge[T] {
-        override def getValue: T = f()
+        override def getValue: T = Option(stream.lastProgress).map(f).getOrElse(default)
       })
     }
   }

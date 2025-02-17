@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions.xml
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.types.StringType
 
@@ -40,8 +41,9 @@ class XPathExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
 
     // Test error message for invalid XML document
     val e1 = intercept[RuntimeException] { testExpr("<a>/a>", "a", null.asInstanceOf[T]) }
-    assert(e1.getCause.getMessage.contains("Invalid XML document") &&
-      e1.getCause.getMessage.contains("<a>/a>"))
+    assert(e1.getCause.getCause.getMessage.contains(
+      "XML document structures must start and end within the same entity."))
+    assert(e1.getMessage.contains("<a>/a>"))
 
     // Test error message for invalid xpath
     val e2 = intercept[RuntimeException] { testExpr("<a></a>", "!#$", null.asInstanceOf[T]) }
@@ -183,6 +185,11 @@ class XPathExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     testExpr("<a><b class='bb'>b1</b><b>b2</b><b>b3</b><c class='bb'>c1</c><c>c2</c></a>",
       "a/*[@class='bb']/text()", Seq("b1", "c1"))
 
+    checkEvaluation(
+      Coalesce(Seq(
+          GetArrayItem(XPathList(Literal("<a></a>"), Literal("a")), Literal(0)),
+          Literal("nul"))), "nul")
+
     testNullAndErrorBehavior(testExpr)
   }
 
@@ -194,7 +201,13 @@ class XPathExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
 
       // Validate that non-foldable paths are not supported.
       val nonLitPath = exprCtor(Literal("abcd"), NonFoldableLiteral("/"))
-      assert(nonLitPath.checkInputDataTypes().isFailure)
+      assert(nonLitPath.checkInputDataTypes() == DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        messageParameters = Map(
+          "inputName" -> "`path`",
+          "inputType" -> "\"STRING\"",
+          "inputExpr" -> "\"nonfoldableliteral()\"")
+      ))
     }
 
     testExpr(XPathBoolean)

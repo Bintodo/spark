@@ -17,11 +17,13 @@
 
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
-import scala.collection.immutable.HashMap
+import scala.collection.immutable.{HashMap, TreeMap}
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.util.GenericArrayData
+import org.apache.spark.sql.catalyst.trees.BinaryLike
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.{GenericArrayData, TypeUtils}
 import org.apache.spark.sql.types._
 
 object PivotFirst {
@@ -73,9 +75,10 @@ case class PivotFirst(
   valueColumn: Expression,
   pivotColumnValues: Seq[Any],
   mutableAggBufferOffset: Int = 0,
-  inputAggBufferOffset: Int = 0) extends ImperativeAggregate {
+  inputAggBufferOffset: Int = 0) extends ImperativeAggregate with BinaryLike[Expression] {
 
-  override val children: Seq[Expression] = pivotColumn :: valueColumn :: Nil
+  override val left: Expression = pivotColumn
+  override val right: Expression = valueColumn
 
   override val nullable: Boolean = false
 
@@ -83,7 +86,12 @@ case class PivotFirst(
 
   override val dataType: DataType = ArrayType(valueDataType)
 
-  val pivotIndex = HashMap(pivotColumnValues.zipWithIndex: _*)
+  val pivotIndex: Map[Any, Int] = if (pivotColumn.dataType.isInstanceOf[AtomicType]) {
+    HashMap(pivotColumnValues.zipWithIndex: _*)
+  } else {
+    TreeMap(pivotColumnValues.zipWithIndex: _*)(
+      TypeUtils.getInterpretedOrdering(pivotColumn.dataType))
+  }
 
   val indexSize = pivotIndex.size
 
@@ -142,9 +150,13 @@ case class PivotFirst(
       AttributeReference(Option(kv._1).getOrElse("null").toString, valueDataType)()
     }
 
-  override val aggBufferSchema: StructType = StructType.fromAttributes(aggBufferAttributes)
+  override val aggBufferSchema: StructType = DataTypeUtils.fromAttributes(aggBufferAttributes)
 
   override val inputAggBufferAttributes: Seq[AttributeReference] =
     aggBufferAttributes.map(_.newInstance())
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression, newRight: Expression): PivotFirst =
+    copy(pivotColumn = newLeft, valueColumn = newRight)
 }
 

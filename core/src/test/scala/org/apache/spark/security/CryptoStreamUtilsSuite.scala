@@ -16,7 +16,7 @@
  */
 package org.apache.spark.security
 
-import java.io.{ByteArrayInputStream, ByteArrayOutputStream, FileInputStream, FileOutputStream}
+import java.io._
 import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
@@ -51,14 +51,14 @@ class CryptoStreamUtilsSuite extends SparkFunSuite {
 
   test("shuffle encryption key length should be 128 by default") {
     val conf = createConf()
-    var key = CryptoStreamUtils.createKey(conf)
+    val key = CryptoStreamUtils.createKey(conf)
     val actual = key.length * (java.lang.Byte.SIZE)
     assert(actual === 128)
   }
 
   test("create 256-bit key") {
     val conf = createConf(IO_ENCRYPTION_KEY_SIZE_BITS.key -> "256")
-    var key = CryptoStreamUtils.createKey(conf)
+    val key = CryptoStreamUtils.createKey(conf)
     val actual = key.length * (java.lang.Byte.SIZE)
     assert(actual === 256)
   }
@@ -72,8 +72,8 @@ class CryptoStreamUtilsSuite extends SparkFunSuite {
 
   test("serializer manager integration") {
     val conf = createConf()
-      .set("spark.shuffle.compress", "true")
-      .set("spark.shuffle.spill.compress", "true")
+      .set(SHUFFLE_COMPRESS, true)
+      .set(SHUFFLE_SPILL_COMPRESS, true)
 
     val plainStr = "hello world"
     val blockId = new TempShuffleBlockId(UUID.randomUUID())
@@ -112,7 +112,7 @@ class CryptoStreamUtilsSuite extends SparkFunSuite {
           bytes.toByteArray()
         }.collect()(0)
 
-      assert(content != encrypted)
+      assert(!content.getBytes(UTF_8).sameElements(encrypted))
 
       val in = CryptoStreamUtils.createCryptoInputStream(new ByteArrayInputStream(encrypted),
         sc.conf, SparkEnv.get.securityManager.getIOEncryptionKey().get)
@@ -130,6 +130,7 @@ class CryptoStreamUtilsSuite extends SparkFunSuite {
     val conf = createConf()
     val key = createKey(conf)
     val file = Files.createTempFile("crypto", ".test").toFile()
+    file.deleteOnExit()
 
     val outStream = createCryptoOutputStream(new FileOutputStream(file), conf, key)
     try {

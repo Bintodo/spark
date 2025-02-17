@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
@@ -28,6 +28,7 @@
 
 set -o pipefail
 set -e
+set -x
 
 FWDIR="$(cd "`dirname "${BASH_SOURCE[0]}"`"; pwd)"
 LIB_DIR="$FWDIR/lib"

@@ -6,3 +6,7 @@
 ^README\.Rmd$
 ^src-native$
 ^html$
+^tests/fulltests/*
+^_pkgdown\.yml$
+^docs$
+^pkgdown$

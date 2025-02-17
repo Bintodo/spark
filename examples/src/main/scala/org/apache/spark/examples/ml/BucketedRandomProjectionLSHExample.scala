@@ -21,9 +21,9 @@ package org.apache.spark.examples.ml
 // $example on$
 import org.apache.spark.ml.feature.BucketedRandomProjectionLSH
 import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.col
 // $example off$
-import org.apache.spark.sql.SparkSession
 
 /**
  * An example demonstrating BucketedRandomProjectionLSH.
@@ -34,7 +34,7 @@ object BucketedRandomProjectionLSHExample {
   def main(args: Array[String]): Unit = {
     // Creates a SparkSession
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("BucketedRandomProjectionLSHExample")
       .getOrCreate()
 

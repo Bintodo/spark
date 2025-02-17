@@ -16,14 +16,13 @@
  */
 package org.apache.spark.status.api.v1
 
-import java.util.{Date, List => JList}
-import javax.ws.rs.{DefaultValue, GET, Produces, QueryParam}
-import javax.ws.rs.core.MediaType
+import java.util.{List => JList}
 
-import org.apache.spark.deploy.history.ApplicationHistoryInfo
+import jakarta.ws.rs.{DefaultValue, GET, Produces, QueryParam}
+import jakarta.ws.rs.core.MediaType
 
 @Produces(Array(MediaType.APPLICATION_JSON))
-private[v1] class ApplicationListResource(uiRoot: UIRoot) {
+private[v1] class ApplicationListResource extends ApiRequestContext {
 
   @GET
   def appList(
@@ -40,7 +39,7 @@ private[v1] class ApplicationListResource(uiRoot: UIRoot) {
     val includeRunning = status.isEmpty || status.contains(ApplicationStatus.RUNNING)
 
     uiRoot.getApplicationInfoList.filter { app =>
-      val anyRunning = app.attempts.exists(!_.completed)
+      val anyRunning = app.attempts.isEmpty || !app.attempts.head.completed
       // if any attempt is still running, we consider the app to also still be running;
       // keep the app if *any* attempts fall in the right time window
       ((!anyRunning && includeCompleted) || (anyRunning && includeRunning)) &&
@@ -65,35 +64,5 @@ private[v1] class ApplicationListResource(uiRoot: UIRoot) {
       attempt.endTime.getTime <= maxEndDate.timestamp)
     val endTimeOk = endTimeOkForRunning || endTimeOkForCompleted
     startTimeOk && endTimeOk
-  }
-}
-
-private[spark] object ApplicationsListResource {
-  def appHistoryInfoToPublicAppInfo(app: ApplicationHistoryInfo): ApplicationInfo = {
-    new ApplicationInfo(
-      id = app.id,
-      name = app.name,
-      coresGranted = None,
-      maxCores = None,
-      coresPerExecutor = None,
-      memoryPerExecutorMB = None,
-      attempts = app.attempts.map { internalAttemptInfo =>
-        new ApplicationAttemptInfo(
-          attemptId = internalAttemptInfo.attemptId,
-          startTime = new Date(internalAttemptInfo.startTime),
-          endTime = new Date(internalAttemptInfo.endTime),
-          duration =
-            if (internalAttemptInfo.endTime > 0) {
-              internalAttemptInfo.endTime - internalAttemptInfo.startTime
-            } else {
-              0
-            },
-          lastUpdated = new Date(internalAttemptInfo.lastUpdated),
-          sparkUser = internalAttemptInfo.sparkUser,
-          completed = internalAttemptInfo.completed,
-          appSparkVersion = internalAttemptInfo.appSparkVersion
-        )
-      }
-    )
   }
 }

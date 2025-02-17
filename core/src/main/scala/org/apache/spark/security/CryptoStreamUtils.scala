@@ -16,21 +16,23 @@
  */
 package org.apache.spark.security
 
-import java.io.{EOFException, InputStream, OutputStream}
+import java.io.{InputStream, OutputStream}
 import java.nio.ByteBuffer
 import java.nio.channels.{ReadableByteChannel, WritableByteChannel}
 import java.util.Properties
+import java.util.concurrent.TimeUnit
 import javax.crypto.KeyGenerator
 import javax.crypto.spec.{IvParameterSpec, SecretKeySpec}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import com.google.common.io.ByteStreams
 import org.apache.commons.crypto.random._
 import org.apache.commons.crypto.stream._
 
 import org.apache.spark.SparkConf
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.network.util.{CryptoUtils, JavaUtils}
 
@@ -125,13 +127,13 @@ private[spark] object CryptoStreamUtils extends Logging {
    */
   private[this] def createInitializationVector(properties: Properties): Array[Byte] = {
     val iv = new Array[Byte](IV_LENGTH_IN_BYTES)
-    val initialIVStart = System.currentTimeMillis()
+    val initialIVStart = System.nanoTime()
     CryptoRandomFactory.getCryptoRandom(properties).nextBytes(iv)
-    val initialIVFinish = System.currentTimeMillis()
-    val initialIVTime = initialIVFinish - initialIVStart
+    val initialIVFinish = System.nanoTime()
+    val initialIVTime = TimeUnit.NANOSECONDS.toMillis(initialIVFinish - initialIVStart)
     if (initialIVTime > 2000) {
-      logWarning(s"It costs ${initialIVTime} milliseconds to create the Initialization Vector " +
-        s"used by CryptoStream")
+      logWarning(log"It costs ${MDC(TIME_UNITS, initialIVTime)} milliseconds " +
+        log"to create the Initialization Vector used by CryptoStream")
     }
     iv
   }

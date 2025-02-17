@@ -18,7 +18,8 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode, FalseLiteral}
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.types.{DataType, LongType}
 
 /**
@@ -38,7 +39,15 @@ import org.apache.spark.sql.types.{DataType, LongType}
       puts the partition ID in the upper 31 bits, and the lower 33 bits represent the record number
       within each partition. The assumption is that the data frame has less than 1 billion
       partitions, and each partition has less than 8 billion records.
-  """)
+      The function is non-deterministic because its result depends on partition IDs.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       0
+  """,
+  since = "1.4.0",
+  group = "misc_funcs")
 case class MonotonicallyIncreasingID() extends LeafExpression with Nondeterministic {
 
   /**
@@ -49,9 +58,15 @@ case class MonotonicallyIncreasingID() extends LeafExpression with Nondeterminis
 
   @transient private[this] var partitionMask: Long = _
 
+  override def stateful: Boolean = true
+
   override protected def initializeInternal(partitionIndex: Int): Unit = {
     count = 0L
     partitionMask = partitionIndex.toLong << 33
+  }
+
+  override def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression = {
+    MonotonicallyIncreasingID()
   }
 
   override def nullable: Boolean = false
@@ -65,19 +80,18 @@ case class MonotonicallyIncreasingID() extends LeafExpression with Nondeterminis
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val countTerm = ctx.freshName("count")
-    val partitionMaskTerm = ctx.freshName("partitionMask")
-    ctx.addMutableState(ctx.JAVA_LONG, countTerm, "")
-    ctx.addMutableState(ctx.JAVA_LONG, partitionMaskTerm, "")
+    val countTerm = ctx.addMutableState(CodeGenerator.JAVA_LONG, "count")
+    val partitionMaskTerm = "partitionMask"
+    ctx.addImmutableStateIfNotExists(CodeGenerator.JAVA_LONG, partitionMaskTerm)
     ctx.addPartitionInitializationStatement(s"$countTerm = 0L;")
     ctx.addPartitionInitializationStatement(s"$partitionMaskTerm = ((long) partitionIndex) << 33;")
 
-    ev.copy(code = s"""
-      final ${ctx.javaType(dataType)} ${ev.value} = $partitionMaskTerm + $countTerm;
-      $countTerm++;""", isNull = "false")
+    ev.copy(code = code"""
+      final ${CodeGenerator.javaType(dataType)} ${ev.value} = $partitionMaskTerm + $countTerm;
+      $countTerm++;""", isNull = FalseLiteral)
   }
 
-  override def prettyName: String = "monotonically_increasing_id"
+  override def nodeName: String = "monotonically_increasing_id"
 
   override def sql: String = s"$prettyName()"
 }
